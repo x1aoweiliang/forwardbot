@@ -3,6 +3,7 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import AsyncSessionLocal, Base, async_engine
+from module_telegram.entity.do import telegram_do  # noqa: F401
 from utils.log_util import logger
 
 

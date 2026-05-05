@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from common.constant import LockConstant
 from common.router import auto_register_routers
+from config.database import AsyncSessionLocal
 from config.env import AppConfig
 from config.get_db import close_async_engine, init_create_table
 from config.get_redis import RedisUtil
@@ -13,6 +14,7 @@ from config.get_scheduler import SchedulerUtil
 from exceptions.handle import handle_exception
 from middlewares.handle import handle_middleware
 from module_admin.service.log_service import LogAggregatorService
+from module_telegram.service.telegram_client_service import TelegramClientManager
 from sub_applications.handle import handle_sub_applications
 from utils.common_util import worship
 from utils.log_util import logger
@@ -29,6 +31,10 @@ async def _start_background_tasks(app: FastAPI) -> None:
     """
     await SchedulerUtil.init_system_scheduler(app.state.redis)
     app.state.log_aggregator_task = asyncio.create_task(LogAggregatorService.consume_stream(app.state.redis))
+
+    if getattr(app.state, 'startup_log_enabled', False):
+        async with AsyncSessionLocal() as query_db:
+            await TelegramClientManager.restore_enabled_listeners(query_db)
 
 
 async def _stop_background_tasks(app: FastAPI) -> None:
@@ -54,6 +60,7 @@ async def _stop_background_tasks(app: FastAPI) -> None:
             pass
     await RedisUtil.close_redis_pool(app)
     await SchedulerUtil.close_system_scheduler()
+    await TelegramClientManager.stop_all()
     await close_async_engine()
 
 
