@@ -835,6 +835,7 @@ comment on table sys_job is '定时任务调度表';
 insert into sys_job values(1, '系统默认（无参）', 'default', 'default', 'module_task.scheduler_test.job', null,   null, '0/10 * * * * ?', '3', '1', '1', 'admin', current_timestamp, '', null, '');
 insert into sys_job values(2, '系统默认（有参）', 'default', 'default', 'module_task.scheduler_test.job', 'test', null, '0/15 * * * * ?', '3', '1', '1', 'admin', current_timestamp, '', null, '');
 insert into sys_job values(3, '系统默认（多参）', 'default', 'default', 'module_task.scheduler_test.job', 'new',  '{test: 111}', '0/20 * * * * ?', '3', '1', '1', 'admin', current_timestamp, '', null, '');
+insert into sys_job values(10, 'TG媒体本地文件清理', 'default', 'default', 'module_task.telegram_media_cleanup.cleanup_expired_local_files', null, null, '0 0 3 * * ?', '3', '1', '0', 'admin', current_timestamp, '', null, '自动删除7天前的Telegram媒体本地文件');
 
 -- ----------------------------
 -- 16、定时任务调度日志表

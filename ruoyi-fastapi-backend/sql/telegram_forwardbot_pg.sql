@@ -153,6 +153,45 @@ create index if not exists idx_tg_message_account_time on tg_message(account_id,
 create index if not exists idx_tg_forward_record_message on tg_forward_record(message_id);
 create index if not exists idx_tg_listener_rule_account_source on tg_listener_rule(account_id, source_chat_pk);
 
+insert into sys_job(
+    job_id,
+    job_name,
+    job_group,
+    job_executor,
+    invoke_target,
+    job_args,
+    job_kwargs,
+    cron_expression,
+    misfire_policy,
+    concurrent,
+    status,
+    create_by,
+    create_time,
+    update_by,
+    update_time,
+    remark
+)
+select
+    10,
+    'TG媒体本地文件清理',
+    'default',
+    'default',
+    'module_task.telegram_media_cleanup.cleanup_expired_local_files',
+    null,
+    null,
+    '0 0 3 * * ?',
+    '3',
+    '1',
+    '0',
+    'admin',
+    current_timestamp,
+    '',
+    null,
+    '自动删除7天前的Telegram媒体本地文件'
+where not exists (
+    select 1 from sys_job where invoke_target = 'module_task.telegram_media_cleanup.cleanup_expired_local_files'
+);
+
 insert into sys_menu values(1900, 'TG管理', 0, 5, 'tg', null, '', '', 1, 0, 'M', '0', '0', '', 'message', 'admin', current_timestamp, '', null, 'TG管理目录')
 on conflict (menu_id) do nothing;
 insert into sys_menu values(1901, '账号管理', 1900, 1, 'account', 'tg/account/index', '', '', 1, 0, 'C', '0', '0', 'tg:account:list', 'user', 'admin', current_timestamp, '', null, 'TG账号管理')

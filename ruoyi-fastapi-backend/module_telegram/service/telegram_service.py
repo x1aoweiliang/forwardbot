@@ -1,9 +1,12 @@
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.vo import CrudResponseModel, PageModel
+from config.env import UploadConfig
 from exceptions.exception import ServiceException
 from module_telegram.dao.telegram_dao import TelegramDao
 from module_telegram.entity.do.telegram_do import (
@@ -527,6 +530,75 @@ class TelegramForwardService:
         return results
 
 
+@dataclass(frozen=True)
+class TelegramMediaCleanupResult:
+    scanned_count: int
+    deleted_count: int
+    missing_count: int
+    skipped_count: int
+
+
+class TelegramMediaCleanupService:
+    """
+    Telegram媒体本地文件清理服务。
+    """
+
+    @staticmethod
+    def _resolve_media_path(base_dir: Path, local_path: str) -> Path | None:
+        try:
+            resolved_base = base_dir.resolve()
+            resolved_path = (base_dir / local_path).resolve()
+            if resolved_path == resolved_base or resolved_base not in resolved_path.parents:
+                return None
+            return resolved_path
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    @classmethod
+    async def cleanup_expired_local_files(
+        cls,
+        db: AsyncSession,
+        base_dir: str | Path = UploadConfig.UPLOAD_PATH,
+        retention_days: int = 7,
+        now: datetime | None = None,
+    ) -> TelegramMediaCleanupResult:
+        current_time = now or datetime.now()
+        cutoff_time = current_time - timedelta(days=retention_days)
+        media_list = await TelegramDao.get_expired_media_with_local_path(db, cutoff_time)
+        base_path = Path(base_dir)
+        clear_media_ids = []
+        deleted_count = 0
+        missing_count = 0
+        skipped_count = 0
+        try:
+            for media in media_list:
+                media_path = cls._resolve_media_path(base_path, media.local_path)
+                if not media_path:
+                    skipped_count += 1
+                    continue
+                if media_path.exists():
+                    if media_path.is_file():
+                        media_path.unlink()
+                        deleted_count += 1
+                        clear_media_ids.append(media.media_id)
+                    else:
+                        skipped_count += 1
+                else:
+                    missing_count += 1
+                    clear_media_ids.append(media.media_id)
+            await TelegramDao.clear_media_local_paths(db, clear_media_ids)
+            await db.commit()
+            return TelegramMediaCleanupResult(
+                scanned_count=len(media_list),
+                deleted_count=deleted_count,
+                missing_count=missing_count,
+                skipped_count=skipped_count,
+            )
+        except Exception as exc:
+            await db.rollback()
+            raise exc
+
+
 class TelegramMessageIngestService:
     """
     Telegram新消息入库、过滤、自动转发服务。
@@ -540,7 +612,15 @@ class TelegramMessageIngestService:
 
     @staticmethod
     def _message_text(message: Any) -> str | None:
-        return getattr(message, 'message', None) or getattr(message, 'text', None)
+        return getattr(message, 'message', None) or getattr(message, 'raw_text', None) or getattr(message, 'text', None)
+
+    @classmethod
+    def _album_text(cls, event: Any, messages: list[Any]) -> str | None:
+        return (
+            getattr(event, 'raw_text', None)
+            or getattr(event, 'text', None)
+            or next((cls._message_text(message) for message in messages if cls._message_text(message)), None)
+        )
 
     @staticmethod
     def _message_file(message: Any) -> Any | None:
@@ -606,12 +686,11 @@ class TelegramMessageIngestService:
 
     @classmethod
     async def ingest_album(cls, db: AsyncSession, account: TgAccount, source_chat: TgChat, event: Any) -> TgMessage:
-        messages = list(getattr(event, 'messages', None) or [])
+        messages = sorted(getattr(event, 'messages', None) or [], key=lambda message: getattr(message, 'id', 0) or 0)
         if not messages:
             return await cls.ingest_event(db, account, source_chat, event)
         first_message = messages[0]
-        text_message = next((message for message in messages if cls._message_text(message)), first_message)
-        message_text = cls._message_text(text_message)
+        message_text = cls._album_text(event, messages)
         sent_at = cls._normalize_sent_at(getattr(first_message, 'date', None))
         words = await TelegramDao.get_enabled_words(db)
         matcher = SensitiveWordMatcher(words, match_case=False)

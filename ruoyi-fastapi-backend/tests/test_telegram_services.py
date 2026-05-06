@@ -1,7 +1,7 @@
 import asyncio
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +19,12 @@ from module_telegram.service.telegram_rule_service import (
     SensitiveWordMatcher,
     TelegramStorageService,
 )
-from module_telegram.service.telegram_service import TelegramCrudService, TelegramForwardService, TelegramMessageIngestService
+from module_telegram.service.telegram_service import (
+    TelegramCrudService,
+    TelegramForwardService,
+    TelegramMediaCleanupService,
+    TelegramMessageIngestService,
+)
 
 
 def test_sensitive_word_matcher_returns_first_enabled_hit() -> None:
@@ -94,6 +99,60 @@ def test_content_clean_policy_removes_configured_text_before_send() -> None:
     result = ContentCleanPolicy.apply('原始消息\n关注大事件频道➡️ @bx666 投稿：@tx188', rules)
 
     assert result == '原始消息'
+
+
+def test_media_cleanup_removes_only_expired_local_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def run_case() -> None:
+        expired_file = tmp_path / 'tg/1/100/expired.jpg'
+        fresh_file = tmp_path / 'tg/1/101/fresh.jpg'
+        external_file = tmp_path.parent / 'external.jpg'
+        expired_file.parent.mkdir(parents=True)
+        fresh_file.parent.mkdir(parents=True)
+        expired_file.write_text('old')
+        fresh_file.write_text('new')
+        external_file.write_text('external')
+        now = datetime(2026, 5, 5, 12, 0, 0)
+        cleared_media_ids = []
+        expired_media_count = 3
+
+        async def fake_get_expired_media(db: object, cutoff_time: datetime) -> list:
+            assert cutoff_time == now - timedelta(days=7)
+            return [
+                SimpleNamespace(media_id=1, local_path='tg/1/100/expired.jpg'),
+                SimpleNamespace(media_id=3, local_path='../external.jpg'),
+                SimpleNamespace(media_id=4, local_path='tg/1/102/missing.jpg'),
+            ]
+
+        async def fake_clear_media_local_paths(db: object, media_ids: list[int]) -> None:
+            cleared_media_ids.extend(media_ids)
+
+        class FakeDb:
+            async def commit(self) -> None:
+                return None
+
+            async def rollback(self) -> None:
+                return None
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_expired_media_with_local_path', fake_get_expired_media)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.clear_media_local_paths', fake_clear_media_local_paths)
+
+        result = await TelegramMediaCleanupService.cleanup_expired_local_files(
+            FakeDb(),
+            base_dir=tmp_path,
+            retention_days=7,
+            now=now,
+        )
+
+        assert expired_file.exists() is False
+        assert fresh_file.exists() is True
+        assert external_file.exists() is True
+        assert cleared_media_ids == [1, 4]
+        assert result.scanned_count == expired_media_count
+        assert result.deleted_count == 1
+        assert result.missing_count == 1
+        assert result.skipped_count == 1
+
+    asyncio.run(run_case())
 
 
 def test_forward_dispatcher_records_failure_without_blocking_other_targets() -> None:
@@ -279,6 +338,63 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
         assert len(stored_medias) == 2
         assert [media['local_path'] for media in stored_medias] == ['tg/1/200/10.jpg', 'tg/1/200/11.jpg']
         assert len(forward_calls) == 1
+
+    asyncio.run(run_case())
+
+
+def test_ingest_album_uses_album_caption_when_message_text_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        stored_messages = []
+        stored_medias = []
+
+        class FakeDb:
+            async def flush(self) -> None:
+                return None
+
+        class FakeStorage:
+            async def save_message_media(self, message: object, account_id: int, message_id: int) -> SimpleNamespace:
+                return SimpleNamespace(absolute_path=Path('/tmp/photo.jpg'), relative_path=f'tg/1/{message_id}/{message.id}.jpg')
+
+        async def fake_get_enabled_words(db: object) -> list:
+            return []
+
+        async def fake_add_message(db: object, data: dict) -> SimpleNamespace:
+            stored_messages.append(data)
+            return SimpleNamespace(message_id=201, **data)
+
+        async def fake_add_media(db: object, data: dict) -> None:
+            stored_medias.append(data)
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return []
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_words', fake_get_enabled_words)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_media', fake_add_media)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+
+        first_album_message_id = 34073
+        album_media_count = 3
+        event = SimpleNamespace(
+            raw_text='相册正文',
+            text='相册正文',
+            messages=[
+                SimpleNamespace(id=first_album_message_id, message='', text='', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg')),
+                SimpleNamespace(id=34074, message='', text='', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg')),
+                SimpleNamespace(id=34075, message='', text='', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg')),
+            ],
+        )
+        await TelegramMessageIngestService.ingest_album(
+            FakeDb(),
+            SimpleNamespace(account_id=1),
+            SimpleNamespace(chat_pk=2, chat_id='source', chat_title='Source'),
+            event,
+        )
+
+        assert stored_messages[0]['telegram_message_id'] == first_album_message_id
+        assert stored_messages[0]['message_text'] == '相册正文'
+        assert len(stored_medias) == album_media_count
 
     asyncio.run(run_case())
 

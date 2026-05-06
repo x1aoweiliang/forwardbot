@@ -125,10 +125,40 @@ class TelegramDao:
     @classmethod
     async def get_media_by_message_id(cls, db: AsyncSession, message_id: int) -> list[TgMessageMedia]:
         return (
-            (await db.execute(select(TgMessageMedia).where(TgMessageMedia.message_id == message_id)))
+            (
+                await db.execute(
+                    select(TgMessageMedia).where(
+                        TgMessageMedia.message_id == message_id,
+                        TgMessageMedia.local_path.isnot(None),
+                        TgMessageMedia.local_path != '',
+                    )
+                )
+            )
             .scalars()
             .all()
         )
+
+    @classmethod
+    async def get_expired_media_with_local_path(cls, db: AsyncSession, cutoff_time: Any) -> list[TgMessageMedia]:
+        return (
+            (
+                await db.execute(
+                    select(TgMessageMedia).where(
+                        TgMessageMedia.create_time < cutoff_time,
+                        TgMessageMedia.local_path.isnot(None),
+                        TgMessageMedia.local_path != '',
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def clear_media_local_paths(cls, db: AsyncSession, media_ids: list[int]) -> None:
+        if not media_ids:
+            return
+        await db.execute(update(TgMessageMedia).where(TgMessageMedia.media_id.in_(media_ids)).values(local_path=''))
 
     @classmethod
     async def add_forward_record(cls, db: AsyncSession, data: dict[str, Any]) -> TgForwardRecord:
