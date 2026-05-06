@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,8 +86,6 @@ class ContentCleanPolicy:
 
     @staticmethod
     def _replace_ignore_case(text: str, match_text: str, replacement: str) -> str:
-        import re
-
         return re.sub(re.escape(match_text), replacement, text, flags=re.IGNORECASE)
 
 
@@ -188,7 +187,7 @@ class ForwardDispatcher:
         self,
         message_id: int,
         target_chat_ids: list[str],
-        file_paths: list[str],
+        files: list[Any],
         text: str | None,
         ad_text: str | None,
         forward_type: str,
@@ -197,7 +196,7 @@ class ForwardDispatcher:
         results = []
         for target_chat_id in target_chat_ids:
             try:
-                sent_message = await self.client.send_file(self._normalize_target_chat(target_chat_id), file_paths, caption=caption)
+                sent_message = await self.client.send_file(self._normalize_target_chat(target_chat_id), files, caption=caption)
                 if isinstance(sent_message, list):
                     sent_message_id = getattr(sent_message[0], 'id', None) if sent_message else None
                 else:

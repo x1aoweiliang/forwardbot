@@ -126,7 +126,9 @@ create table if not exists tg_message_media (
     media_id bigserial primary key,
     message_id bigint not null,
     media_type varchar(30) not null,
-    local_path varchar(500) not null,
+    local_path varchar(500) not null default '',
+    source_telegram_message_id bigint,
+    media_index integer not null default 0,
     file_name varchar(255),
     mime_type varchar(100),
     file_size bigint,
@@ -154,7 +156,6 @@ create index if not exists idx_tg_forward_record_message on tg_forward_record(me
 create index if not exists idx_tg_listener_rule_account_source on tg_listener_rule(account_id, source_chat_pk);
 
 insert into sys_job(
-    job_id,
     job_name,
     job_group,
     job_executor,
@@ -172,7 +173,6 @@ insert into sys_job(
     remark
 )
 select
-    10,
     'TG媒体本地文件清理',
     'default',
     'default',

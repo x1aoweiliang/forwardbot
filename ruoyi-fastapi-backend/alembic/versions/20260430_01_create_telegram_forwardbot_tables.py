@@ -154,7 +154,9 @@ def upgrade() -> None:
             sa.Column('media_id', sa.BigInteger(), autoincrement=True, nullable=False, comment='媒体主键'),
             sa.Column('message_id', sa.BigInteger(), nullable=False, comment='消息ID'),
             sa.Column('media_type', sa.String(length=30), nullable=False, comment='媒体类型'),
-            sa.Column('local_path', sa.String(length=500), nullable=False, comment='本地相对路径'),
+            sa.Column('local_path', sa.String(length=500), server_default='', nullable=False, comment='本地相对路径'),
+            sa.Column('source_telegram_message_id', sa.BigInteger(), nullable=True, comment='源Telegram媒体消息ID'),
+            sa.Column('media_index', sa.Integer(), server_default='0', nullable=False, comment='媒体顺序'),
             sa.Column('file_name', sa.String(length=255), nullable=True, comment='文件名'),
             sa.Column('mime_type', sa.String(length=100), nullable=True, comment='MIME类型'),
             sa.Column('file_size', sa.BigInteger(), nullable=True, comment='文件大小'),
@@ -162,6 +164,17 @@ def upgrade() -> None:
             sa.PrimaryKeyConstraint('media_id'),
             comment='Telegram消息媒体表',
         )
+    else:
+        if not _has_column('tg_message_media', 'source_telegram_message_id'):
+            op.add_column(
+                'tg_message_media',
+                sa.Column('source_telegram_message_id', sa.BigInteger(), nullable=True, comment='源Telegram媒体消息ID'),
+            )
+        if not _has_column('tg_message_media', 'media_index'):
+            op.add_column(
+                'tg_message_media',
+                sa.Column('media_index', sa.Integer(), server_default='0', nullable=False, comment='媒体顺序'),
+            )
 
     if not _has_table('tg_forward_record'):
         op.create_table(

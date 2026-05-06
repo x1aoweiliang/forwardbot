@@ -189,6 +189,8 @@ class TgMessageMediaModel(TelegramBaseModel):
     message_id: int | None = Field(default=None, description='消息ID')
     media_type: str | None = Field(default=None, description='媒体类型')
     local_path: str | None = Field(default=None, description='本地相对路径')
+    source_telegram_message_id: int | None = Field(default=None, description='源Telegram媒体消息ID')
+    media_index: int | None = Field(default=None, description='媒体顺序')
     file_name: str | None = Field(default=None, description='文件名')
     mime_type: str | None = Field(default=None, description='MIME类型')
     file_size: int | None = Field(default=None, description='文件大小')

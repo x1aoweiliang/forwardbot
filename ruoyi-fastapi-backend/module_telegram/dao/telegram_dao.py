@@ -127,11 +127,9 @@ class TelegramDao:
         return (
             (
                 await db.execute(
-                    select(TgMessageMedia).where(
-                        TgMessageMedia.message_id == message_id,
-                        TgMessageMedia.local_path.isnot(None),
-                        TgMessageMedia.local_path != '',
-                    )
+                    select(TgMessageMedia)
+                    .where(TgMessageMedia.message_id == message_id)
+                    .order_by(TgMessageMedia.media_index, TgMessageMedia.media_id)
                 )
             )
             .scalars()
@@ -159,6 +157,10 @@ class TelegramDao:
         if not media_ids:
             return
         await db.execute(update(TgMessageMedia).where(TgMessageMedia.media_id.in_(media_ids)).values(local_path=''))
+
+    @classmethod
+    async def update_media_local_path(cls, db: AsyncSession, media_id: int, local_path: str) -> None:
+        await db.execute(update(TgMessageMedia).where(TgMessageMedia.media_id == media_id).values(local_path=local_path))
 
     @classmethod
     async def add_forward_record(cls, db: AsyncSession, data: dict[str, Any]) -> TgForwardRecord:

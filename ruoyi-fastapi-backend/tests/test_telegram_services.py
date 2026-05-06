@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import os
 import sys
 from datetime import UTC, datetime, timedelta
@@ -212,7 +213,7 @@ def test_ingest_event_blocks_sensitive_message_before_forward(monkeypatch: pytes
 
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_words', fake_get_enabled_words)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
-        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', FakeStorage)
         monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
 
         event = SimpleNamespace(message=SimpleNamespace(id=1, message='contains spam', text='contains spam', date=None), media=None)
@@ -227,6 +228,76 @@ def test_ingest_event_blocks_sensitive_message_before_forward(monkeypatch: pytes
         assert stored_messages[0]['is_sensitive'] == 'Y'
         assert stored_messages[0]['sensitive_word'] == 'spam'
         assert forward_calls == []
+
+    asyncio.run(run_case())
+
+
+def test_ingest_event_records_media_reference_without_downloading(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        stored_medias = []
+        forwarded = []
+
+        class FakeDb:
+            async def flush(self) -> None:
+                return None
+
+        class FakeMessage:
+            id = 42
+            message = 'photo caption'
+            text = 'photo caption'
+            date = None
+            media = object()
+            file = SimpleNamespace(mime_type='image/jpeg', name='photo.jpg', size=123)
+
+            async def download_media(self, file: str) -> None:
+                raise AssertionError('media should not be downloaded during ingest')
+
+        async def fake_get_enabled_words(db: object) -> list:
+            return []
+
+        async def fake_add_message(db: object, data: dict) -> SimpleNamespace:
+            return SimpleNamespace(message_id=300, **data)
+
+        async def fake_add_media(db: object, data: dict) -> None:
+            stored_medias.append(data)
+
+        async def fake_forward_to_chats(cls: type, db: object, account: object, message: object, target_chats: list, forward_type: str, source_messages: list | None = None) -> None:
+            forwarded.append(source_messages)
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return [SimpleNamespace(source_chat_pk=2, target_chat_pks='3')]
+
+        async def fake_get_chats(db: object, chat_pks: list[int]) -> list:
+            return [SimpleNamespace(chat_pk=3, chat_id='target', chat_title='Target')]
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_words', fake_get_enabled_words)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_media', fake_add_media)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats)
+        monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
+
+        source_message = FakeMessage()
+        await TelegramMessageIngestService.ingest_event(
+            FakeDb(),
+            SimpleNamespace(account_id=1),
+            SimpleNamespace(chat_pk=2, chat_id='source', chat_title='Source'),
+            SimpleNamespace(message=source_message, media=object()),
+        )
+
+        assert stored_medias == [
+            {
+                'message_id': 300,
+                'media_type': 'media',
+                'local_path': '',
+                'source_telegram_message_id': 42,
+                'media_index': 0,
+                'file_name': 'photo.jpg',
+                'mime_type': 'image/jpeg',
+                'file_size': 123,
+            }
+        ]
+        assert forwarded == [[source_message]]
 
     asyncio.run(run_case())
 
@@ -287,10 +358,6 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
             async def flush(self) -> None:
                 return None
 
-        class FakeStorage:
-            async def save_message_media(self, message: object, account_id: int, message_id: int) -> SimpleNamespace:
-                return SimpleNamespace(absolute_path=Path('/tmp/photo.jpg'), relative_path=f'tg/1/{message_id}/{message.id}.jpg')
-
         async def fake_get_enabled_words(db: object) -> list:
             return []
 
@@ -315,7 +382,6 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_media', fake_add_media)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats)
-        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
         monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
 
         event = SimpleNamespace(
@@ -336,7 +402,9 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
         assert stored_messages[0]['telegram_message_id'] == 10
         assert stored_messages[0]['message_text'] == 'caption'
         assert len(stored_medias) == 2
-        assert [media['local_path'] for media in stored_medias] == ['tg/1/200/10.jpg', 'tg/1/200/11.jpg']
+        assert [media['local_path'] for media in stored_medias] == ['', '']
+        assert [media['source_telegram_message_id'] for media in stored_medias] == [10, 11]
+        assert [media['media_index'] for media in stored_medias] == [0, 1]
         assert len(forward_calls) == 1
 
     asyncio.run(run_case())
@@ -446,6 +514,424 @@ def test_manual_forward_does_not_update_auto_forward_status(monkeypatch: pytest.
         assert update_calls == []
 
     asyncio.run(run_case())
+
+
+def test_manual_forward_reuses_source_media_without_local_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        sent_files = []
+        records = []
+        source_media = SimpleNamespace(id=42, media=object())
+
+        class FakeClient:
+            async def get_messages(self, source_chat_id: str, ids: list[int]) -> list:
+                assert source_chat_id == 'source-chat'
+                assert ids == [42]
+                return [source_media]
+
+            async def send_file(self, target_chat_id: str, files: list, caption: str) -> SimpleNamespace:
+                sent_files.append((target_chat_id, files, caption))
+                return SimpleNamespace(id=500)
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> SimpleNamespace:
+            return SimpleNamespace(ad_content='ad')
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [
+                SimpleNamespace(
+                    media_id=1,
+                    source_telegram_message_id=42,
+                    media_index=0,
+                    local_path='',
+                )
+            ]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+
+        await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert sent_files == [('target', [source_media], 'caption\n\n\nad')]
+        assert records[0]['status'] == 'success'
+
+    asyncio.run(run_case())
+
+
+def test_manual_forward_falls_back_to_local_path_for_legacy_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        sent_files = []
+
+        class FakeClient:
+            async def send_file(self, target_chat_id: str, file_paths: list[str], caption: str) -> SimpleNamespace:
+                sent_files.append((target_chat_id, file_paths, caption))
+                return SimpleNamespace(id=501)
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> None:
+            return None
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [SimpleNamespace(media_id=1, source_telegram_message_id=None, media_index=0, local_path='tg/1/10/photo.jpg')]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            return None
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_rule_service.TelegramStorageService', lambda: TelegramStorageService(base_dir='/tmp/base'))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: TelegramStorageService(base_dir='/tmp/base'))
+
+        await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert sent_files == [('target', ['/tmp/base/tg/1/10/photo.jpg'], 'caption')]
+
+    asyncio.run(run_case())
+
+
+def test_manual_forward_falls_back_to_local_path_when_source_lookup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        sent_files = []
+
+        class FakeClient:
+            async def get_messages(self, source_chat_id: str, ids: list[int]) -> list:
+                raise RuntimeError('source unavailable')
+
+            async def send_file(self, target_chat_id: str, file_paths: list[str], caption: str) -> SimpleNamespace:
+                sent_files.append((target_chat_id, file_paths, caption))
+                return SimpleNamespace(id=503)
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> None:
+            return None
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path='tg/1/10/photo.jpg')]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            return None
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: TelegramStorageService(base_dir='/tmp/base'))
+
+        await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert sent_files == [('target', ['/tmp/base/tg/1/10/photo.jpg'], 'caption')]
+
+    asyncio.run(run_case())
+
+
+def test_manual_forward_records_failure_when_media_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        records = []
+
+        class FakeClient:
+            async def get_messages(self, source_chat_id: str, ids: list[int]) -> list:
+                return []
+
+            async def send_file(self, target_chat_id: str, file_paths: list[str], caption: str) -> SimpleNamespace:
+                raise AssertionError('send_file should not be called without source media or local files')
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> None:
+            return None
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path='')]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+
+        results = await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert [result.status for result in results] == ['failed']
+        assert results[0].error_message == '媒体文件不可用'
+        assert records[0]['status'] == 'failed'
+        assert records[0]['error_message'] == '媒体文件不可用'
+
+    asyncio.run(run_case())
+
+
+def test_manual_forward_does_not_send_partial_album_when_source_lookup_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        records = []
+        source_media_a = SimpleNamespace(id=42, media=object())
+        source_media_b = SimpleNamespace(id=43, media=object())
+
+        class FakeClient:
+            async def get_messages(self, source_chat_id: str, ids: list[int]) -> list:
+                assert ids == [42, 43, 44]
+                return [source_media_a, source_media_b]
+
+            async def send_file(self, target_chat_id: str, files: list, caption: str) -> SimpleNamespace:
+                raise AssertionError('partial album should not be sent')
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> None:
+            return None
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [
+                SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path=''),
+                SimpleNamespace(media_id=2, source_telegram_message_id=43, media_index=1, local_path=''),
+                SimpleNamespace(media_id=3, source_telegram_message_id=44, media_index=2, local_path=''),
+            ]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+
+        results = await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert [result.status for result in results] == ['failed']
+        assert results[0].error_message == '媒体文件不可用'
+        assert records[0]['status'] == 'failed'
+
+    asyncio.run(run_case())
+
+
+def test_manual_forward_uses_complete_fallback_when_source_album_lookup_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        sent_files = []
+        source_media_a = SimpleNamespace(id=42, media=object())
+        source_media_b = SimpleNamespace(id=43, media=object())
+
+        class FakeClient:
+            async def get_messages(self, source_chat_id: str, ids: list[int]) -> list:
+                return [source_media_a, source_media_b]
+
+            async def send_file(self, target_chat_id: str, files: list, caption: str) -> SimpleNamespace:
+                sent_files.append((target_chat_id, files, caption))
+                return SimpleNamespace(id=504)
+
+        class FakeStorage:
+            base_dir = Path('/tmp/base')
+
+            async def save_message_media(self, message: object, account_id: int, message_id: int) -> SimpleNamespace:
+                return SimpleNamespace(
+                    absolute_path=Path(f'/tmp/base/tg/1/10/{message.id}.jpg'),
+                    relative_path=f'tg/1/10/{message.id}.jpg',
+                )
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> None:
+            return None
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [
+                SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path=''),
+                SimpleNamespace(media_id=2, source_telegram_message_id=43, media_index=1, local_path=''),
+                SimpleNamespace(media_id=3, source_telegram_message_id=44, media_index=2, local_path='tg/1/10/44.jpg'),
+            ]
+
+        async def fake_update_media_local_path(db: object, media_id: int, local_path: str) -> None:
+            return None
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            return None
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_media_local_path', fake_update_media_local_path)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+
+        results = await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert [result.status for result in results] == ['success']
+        assert sent_files == [
+            (
+                'target',
+                [
+                    '/tmp/base/tg/1/10/42.jpg',
+                    '/tmp/base/tg/1/10/43.jpg',
+                    '/tmp/base/tg/1/10/44.jpg',
+                ],
+                'caption',
+            )
+        ]
+
+    asyncio.run(run_case())
+
+
+def test_auto_forward_falls_back_to_download_when_source_media_send_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def run_case() -> None:
+        sent_files = []
+        updated_paths = []
+        source_message = SimpleNamespace(id=42, media=object())
+
+        class FakeClient:
+            async def send_file(self, target_chat_id: str, files: list, caption: str) -> SimpleNamespace:
+                sent_files.append((target_chat_id, files, caption))
+                if files == [source_message]:
+                    raise RuntimeError('source media expired')
+                return SimpleNamespace(id=502)
+
+        class FakeStorage:
+            base_dir = tmp_path
+
+            async def save_message_media(self, message: object, account_id: int, message_id: int) -> SimpleNamespace:
+                assert message is source_message
+                return SimpleNamespace(absolute_path=tmp_path / 'tg/1/10/42.jpg', relative_path='tg/1/10/42.jpg')
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> None:
+            return None
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path='')]
+
+        async def fake_update_media_local_path(db: object, media_id: int, local_path: str) -> None:
+            updated_paths.append((media_id, local_path))
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            return None
+
+        async def fake_update_message(db: object, data: dict) -> None:
+            return None
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_media_local_path', fake_update_media_local_path)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_message', fake_update_message)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+
+        await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', message_text='caption'),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='auto',
+            source_messages=[source_message],
+        )
+
+        assert sent_files == [
+            ('target', [source_message], 'caption'),
+            ('target', [str(tmp_path / 'tg/1/10/42.jpg')], 'caption'),
+        ]
+        assert updated_paths == [(1, 'tg/1/10/42.jpg')]
+
+    asyncio.run(run_case())
+
+
+def test_tg_media_source_reference_migration_sets_local_path_default() -> None:
+    migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260506_01_add_tg_media_source_reference.py'
+    spec = importlib.util.spec_from_file_location('tg_media_source_reference_migration', migration_path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    alter_calls = []
+
+    migration._has_table = lambda table_name: table_name == 'tg_message_media'
+    migration._has_column = lambda table_name, column_name: column_name in {'local_path'}
+    migration.op.add_column = lambda *args, **kwargs: None
+    migration.op.alter_column = lambda *args, **kwargs: alter_calls.append((args, kwargs))
+
+    migration.upgrade()
+
+    assert any(
+        args[:2] == ('tg_message_media', 'local_path') and kwargs.get('server_default') == ''
+        for args, kwargs in alter_calls
+    )
 
 
 def test_forward_service_cleans_content_before_appending_ad(monkeypatch: pytest.MonkeyPatch) -> None:
