@@ -31,7 +31,7 @@ def _has_column(table_name: str, column_name: str) -> bool:
     return any(column['name'] == column_name for column in inspector.get_columns(table_name))
 
 
-def upgrade() -> None:
+def upgrade() -> None:  # noqa: PLR0912
     """Upgrade schema."""
     if not _has_table('tg_account'):
         op.create_table(
@@ -83,6 +83,7 @@ def upgrade() -> None:
             sa.Column('rule_id', sa.BigInteger(), autoincrement=True, nullable=False, comment='规则主键'),
             sa.Column('account_id', sa.BigInteger(), nullable=False, comment='监听账号ID'),
             sa.Column('source_chat_pk', sa.BigInteger(), nullable=False, comment='来源频道主键'),
+            sa.Column('source_chat_pks', sa.String(length=1000), nullable=True, comment='来源频道主键，逗号分隔'),
             sa.Column('target_chat_pks', sa.String(length=1000), nullable=False, comment='目标频道主键，逗号分隔'),
             sa.Column('rule_name', sa.String(length=100), nullable=False, comment='规则名称'),
             sa.Column('status', sa.CHAR(length=1), server_default='0', nullable=False, comment='状态（0启用 1停用）'),
@@ -93,6 +94,11 @@ def upgrade() -> None:
             sa.Column('remark', sa.String(length=500), nullable=True, comment='备注'),
             sa.PrimaryKeyConstraint('rule_id'),
             comment='Telegram监听规则表',
+        )
+    elif not _has_column('tg_listener_rule', 'source_chat_pks'):
+        op.add_column(
+            'tg_listener_rule',
+            sa.Column('source_chat_pks', sa.String(length=1000), nullable=True, comment='来源频道主键，逗号分隔'),
         )
 
     if not _has_table('tg_sensitive_word'):

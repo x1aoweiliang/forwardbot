@@ -76,6 +76,7 @@ class TgListenerRuleModel(TelegramBaseModel):
     rule_id: int | None = Field(default=None, description='规则主键')
     account_id: int | None = Field(default=None, description='账号ID')
     source_chat_pk: int | None = Field(default=None, description='来源频道主键')
+    source_chat_pks: str | None = Field(default=None, description='来源频道主键，逗号分隔')
     target_chat_pks: str | None = Field(default=None, description='目标频道主键，逗号分隔')
     rule_name: str | None = Field(default=None, description='规则名称')
     status: Literal['0', '1'] | None = Field(default='0', description='状态')
@@ -89,6 +90,7 @@ class TgListenerRuleModel(TelegramBaseModel):
 class TgListenerRulePageQueryModel(TgListenerRuleModel):
     account_id: int | None = Field(default=None, description='账号ID')
     source_chat_pk: int | None = Field(default=None, description='来源频道主键')
+    source_chat_pks: str | None = Field(default=None, description='来源频道主键，逗号分隔')
     rule_name: str | None = Field(default=None, description='规则名称')
     status: Literal['0', '1'] | None = Field(default=None, description='状态')
     page_num: int = Field(default=1, description='当前页码')

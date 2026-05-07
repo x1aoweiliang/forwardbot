@@ -89,6 +89,39 @@ class ContentCleanPolicy:
         return re.sub(re.escape(match_text), replacement, text, flags=re.IGNORECASE)
 
 
+class ListenerRulePolicy:
+    """
+    监听规则的来源/目标频道解析策略。
+    """
+
+    @staticmethod
+    def parse_chat_pks(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, int):
+            return [value]
+        values = value if isinstance(value, list | tuple | set) else str(value).split(',')
+        chat_pks = []
+        seen = set()
+        for item in values:
+            text = str(item).strip()
+            if not text:
+                continue
+            chat_pk = int(text)
+            if chat_pk in seen:
+                continue
+            seen.add(chat_pk)
+            chat_pks.append(chat_pk)
+        return chat_pks
+
+    @classmethod
+    def source_chat_pks(cls, rule: Any) -> list[int]:
+        source_pks = cls.parse_chat_pks(getattr(rule, 'source_chat_pks', None))
+        if source_pks:
+            return source_pks
+        return cls.parse_chat_pks(getattr(rule, 'source_chat_pk', None))
+
+
 @dataclass(frozen=True)
 class StoragePath:
     absolute_path: Path

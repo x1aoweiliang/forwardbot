@@ -986,6 +986,94 @@ def test_forward_service_cleans_content_before_appending_ad(monkeypatch: pytest.
     asyncio.run(run_case())
 
 
+def test_save_rule_normalizes_multiple_source_chats(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        stored_payloads = []
+
+        class FakeDb:
+            async def commit(self) -> None:
+                return None
+
+            async def rollback(self) -> None:
+                return None
+
+        async def fake_add_item(db: object, model: type, data: dict) -> SimpleNamespace:
+            stored_payloads.append(data)
+            return SimpleNamespace(**data)
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_item', fake_add_item)
+
+        result = await TelegramCrudService.save_rule(
+            FakeDb(),
+            SimpleNamespace(
+                model_dump=lambda exclude_unset, exclude_none: {
+                    'account_id': 1,
+                    'rule_name': 'multi source',
+                    'source_chat_pks': '2, 3,2',
+                    'target_chat_pks': '8,9',
+                    'status': '0',
+                }
+            ),
+        )
+
+        assert result.is_success is True
+        assert stored_payloads[0]['source_chat_pk'] == 2
+        assert stored_payloads[0]['source_chat_pks'] == '2,3'
+
+    asyncio.run(run_case())
+
+
+def test_save_rule_requires_at_least_one_source_chat() -> None:
+    async def run_case() -> None:
+        with pytest.raises(Exception) as exc_info:
+            await TelegramCrudService.save_rule(
+                object(),
+                SimpleNamespace(
+                    model_dump=lambda exclude_unset, exclude_none: {
+                        'account_id': 1,
+                        'rule_name': 'missing source',
+                        'target_chat_pks': '8',
+                        'status': '0',
+                    }
+                ),
+            )
+        assert getattr(exc_info.value, 'message', None) == '来源频道不能为空'
+
+    asyncio.run(run_case())
+
+
+def test_auto_forward_matches_any_source_in_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        forward_calls = []
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return [SimpleNamespace(source_chat_pk=1, source_chat_pks='1,2', target_chat_pks='8')]
+
+        async def fake_get_chats(db: object, chat_pks: list[int]) -> list:
+            return [SimpleNamespace(chat_pk=8, chat_id='target', chat_title='Target')]
+
+        async def fake_forward_to_chats(cls: type, db: object, account: object, message: object, targets: list, forward_type: str, source_messages: list | None = None) -> None:
+            forward_calls.append((targets, forward_type, source_messages))
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats)
+        monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
+
+        await TelegramMessageIngestService._forward_source_message_by_rules(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            source_chat=SimpleNamespace(chat_pk=2),
+            db_message=SimpleNamespace(message_id=10),
+            source_messages=[SimpleNamespace(id=42)],
+        )
+
+        assert len(forward_calls) == 1
+        assert forward_calls[0][0][0].chat_pk == 8
+        assert forward_calls[0][1] == 'auto'
+
+    asyncio.run(run_case())
+
+
 def test_start_listener_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_case() -> None:
         added_handlers = []
@@ -1018,6 +1106,54 @@ def test_start_listener_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 
         assert [builder[0] for _, builder in added_handlers] == ['new', 'album']
         assert len(TelegramClientManager._handlers[1]) == 2
+
+    asyncio.run(run_case())
+
+
+def test_start_listener_registers_all_sources_from_multi_source_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        added_builders = []
+
+        class FakeClient:
+            def add_event_handler(self, handler: object, builder: object) -> None:
+                added_builders.append(builder)
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return [
+                SimpleNamespace(source_chat_pk=1, source_chat_pks='1,2'),
+                SimpleNamespace(source_chat_pk=3, source_chat_pks=None),
+            ]
+
+        async def fake_get_chats(db: object, chat_pks: list[int]) -> list:
+            assert chat_pks == [1, 2, 3]
+            return [
+                SimpleNamespace(chat_pk=1, chat_id='source-a', can_listen='Y', status='0'),
+                SimpleNamespace(chat_pk=2, chat_id='source-b', can_listen='Y', status='0'),
+                SimpleNamespace(chat_pk=3, chat_id='source-c', can_listen='Y', status='0'),
+            ]
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_client_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_client_service.TelegramDao.get_chats_by_pks', fake_get_chats)
+        monkeypatch.setattr(
+            'module_telegram.service.telegram_client_service.events',
+            SimpleNamespace(NewMessage=lambda chats: ('new', chats), Album=lambda chats: ('album', chats)),
+        )
+        TelegramClientManager._handlers.clear()
+
+        await TelegramClientManager.start_listener(object(), SimpleNamespace(account_id=1))
+
+        assert added_builders == [
+            ('new', 'source-a'),
+            ('album', 'source-a'),
+            ('new', 'source-b'),
+            ('album', 'source-b'),
+            ('new', 'source-c'),
+            ('album', 'source-c'),
+        ]
 
     asyncio.run(run_case())
 

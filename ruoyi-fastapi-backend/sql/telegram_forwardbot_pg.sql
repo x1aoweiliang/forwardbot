@@ -43,6 +43,7 @@ create table if not exists tg_listener_rule (
     rule_id bigserial primary key,
     account_id bigint not null,
     source_chat_pk bigint not null,
+    source_chat_pks varchar(1000),
     target_chat_pks varchar(1000) not null,
     rule_name varchar(100) not null,
     status char(1) not null default '0',

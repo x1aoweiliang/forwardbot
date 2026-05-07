@@ -72,6 +72,7 @@ class TgListenerRule(Base):
     rule_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='规则主键')
     account_id = Column(BigInteger, nullable=False, comment='监听账号ID')
     source_chat_pk = Column(BigInteger, nullable=False, comment='来源频道主键')
+    source_chat_pks = Column(String(1000), nullable=True, comment='来源频道主键，逗号分隔')
     target_chat_pks = Column(String(1000), nullable=False, comment='目标频道主键，逗号分隔')
     rule_name = Column(String(100), nullable=False, comment='规则名称')
     status = Column(CHAR(1), nullable=False, server_default='0', comment='状态（0启用 1停用）')

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from exceptions.exception import ServiceException
 from module_telegram.dao.telegram_dao import TelegramDao
 from module_telegram.entity.do.telegram_do import TgAccount
+from module_telegram.service.telegram_rule_service import ListenerRulePolicy
 from utils.log_util import logger
 
 try:
@@ -198,7 +199,7 @@ class TelegramClientManager:
             return
         client = await cls.get_authorized_client(account)
         rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
-        source_pks = sorted({rule.source_chat_pk for rule in rules})
+        source_pks = sorted({source_pk for rule in rules for source_pk in ListenerRulePolicy.source_chat_pks(rule)})
         source_chats = await TelegramDao.get_chats_by_pks(db, source_pks)
         cls._handlers.setdefault(account.account_id, [])
 

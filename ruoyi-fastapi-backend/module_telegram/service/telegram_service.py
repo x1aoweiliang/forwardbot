@@ -42,6 +42,7 @@ from module_telegram.service.telegram_rule_service import (
     ContentCleanPolicy,
     ForwardDispatcher,
     ForwardDispatchResult,
+    ListenerRulePolicy,
     SensitiveWordMatcher,
     TelegramStorageService,
 )
@@ -271,8 +272,13 @@ class TelegramCrudService:
     @classmethod
     async def save_rule(cls, db: AsyncSession, item: TgListenerRuleModel) -> CrudResponseModel:
         data = cls._clean_payload(item)
+        source_pks = ListenerRulePolicy.parse_chat_pks(data.get('source_chat_pks') or data.get('source_chat_pk'))
+        if not source_pks:
+            raise ServiceException(message='来源频道不能为空')
         if not data.get('target_chat_pks'):
             raise ServiceException(message='目标频道不能为空')
+        data['source_chat_pk'] = source_pks[0]
+        data['source_chat_pks'] = ','.join(str(pk) for pk in source_pks)
         try:
             if data.get('rule_id'):
                 data['update_time'] = datetime.now()
@@ -785,9 +791,9 @@ class TelegramMessageIngestService:
         source_messages: list[Any],
     ) -> None:
         rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
-        matched_rules = [rule for rule in rules if rule.source_chat_pk == source_chat.chat_pk]
+        matched_rules = [rule for rule in rules if source_chat.chat_pk in ListenerRulePolicy.source_chat_pks(rule)]
         for rule in matched_rules:
-            target_pks = [int(pk) for pk in rule.target_chat_pks.split(',') if pk.strip()]
+            target_pks = ListenerRulePolicy.parse_chat_pks(rule.target_chat_pks)
             targets = await TelegramDao.get_chats_by_pks(db, target_pks)
             await TelegramForwardService.forward_to_chats(db, account, db_message, targets, 'auto', source_messages=source_messages)
 
