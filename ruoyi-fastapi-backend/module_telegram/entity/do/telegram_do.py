@@ -53,6 +53,7 @@ class TgChat(Base):
     chat_type = Column(String(30), nullable=False, comment='类型：group/channel/private')
     can_listen = Column(CHAR(1), nullable=False, server_default='N', comment='是否可监听')
     can_send = Column(CHAR(1), nullable=False, server_default='N', comment='是否可发送')
+    ad_text_id = Column(BigInteger, nullable=True, comment='目标群广告词ID')
     status = Column(CHAR(1), nullable=False, server_default='0', comment='状态（0启用 1停用）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, default=datetime.now, comment='创建时间')

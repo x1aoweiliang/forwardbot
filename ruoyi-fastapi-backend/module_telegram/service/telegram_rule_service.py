@@ -43,14 +43,12 @@ class SensitiveWordMatcher:
 
 class AdTextPolicy:
     """
-    广告词策略：同一时间只能启用一个。
+    广告词策略。
     """
 
     @staticmethod
     def validate_single_enabled(records: list[Any]) -> bool:
-        enabled_count = sum(1 for record in records if getattr(record, 'enabled', None) == '1')
-        if enabled_count > 1:
-            raise ValueError('只能启用一个广告词')
+        _ = records
         return True
 
     @staticmethod
@@ -61,6 +59,12 @@ class AdTextPolicy:
         if not base_text:
             return ad_text
         return f'{base_text}\n\n\n{ad_text}'
+
+    @classmethod
+    def target_ad_text(cls, ad_text: str | dict[str, str | None] | None, target_chat_id: str) -> str | None:
+        if isinstance(ad_text, dict):
+            return ad_text.get(target_chat_id)
+        return ad_text
 
 
 class ContentCleanPolicy:
@@ -187,12 +191,12 @@ class ForwardDispatcher:
         message_id: int,
         target_chat_ids: list[str],
         text: str | None,
-        ad_text: str | None,
+        ad_text: str | dict[str, str | None] | None,
         forward_type: str,
     ) -> list[ForwardDispatchResult]:
-        content = AdTextPolicy.append_ad_text(text, ad_text)
         results = []
         for target_chat_id in target_chat_ids:
+            content = AdTextPolicy.append_ad_text(text, AdTextPolicy.target_ad_text(ad_text, target_chat_id))
             try:
                 sent_message = await self.client.send_message(self._normalize_target_chat(target_chat_id), content, link_preview=False)
                 results.append(
@@ -204,7 +208,7 @@ class ForwardDispatcher:
                         sent_telegram_message_id=getattr(sent_message, 'id', None),
                     )
                 )
-            except Exception as exc:  # noqa: PERF203
+            except Exception as exc:
                 results.append(
                     ForwardDispatchResult(
                         message_id=message_id,
@@ -222,12 +226,12 @@ class ForwardDispatcher:
         target_chat_ids: list[str],
         files: list[Any],
         text: str | None,
-        ad_text: str | None,
+        ad_text: str | dict[str, str | None] | None,
         forward_type: str,
     ) -> list[ForwardDispatchResult]:
-        caption = AdTextPolicy.append_ad_text(text, ad_text)
         results = []
         for target_chat_id in target_chat_ids:
+            caption = AdTextPolicy.append_ad_text(text, AdTextPolicy.target_ad_text(ad_text, target_chat_id))
             try:
                 sent_message = await self.client.send_file(self._normalize_target_chat(target_chat_id), files, caption=caption)
                 if isinstance(sent_message, list):
@@ -243,7 +247,7 @@ class ForwardDispatcher:
                         sent_telegram_message_id=sent_message_id,
                     )
                 )
-            except Exception as exc:  # noqa: PERF203
+            except Exception as exc:
                 results.append(
                     ForwardDispatchResult(
                         message_id=message_id,

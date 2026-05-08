@@ -150,6 +150,8 @@ class TelegramCrudService:
     @classmethod
     async def save_chat(cls, db: AsyncSession, item: TgChatModel) -> CrudResponseModel:
         data = cls._clean_payload(item)
+        if 'ad_text_id' in item.model_fields_set:
+            data['ad_text_id'] = item.ad_text_id
         try:
             if data.get('chat_pk'):
                 data['update_time'] = datetime.now()
@@ -374,7 +376,7 @@ class TelegramCrudService:
             await TelegramDao.disable_other_ad_texts(db, ad_id)
             await TelegramDao.update_item(db, TgAdText, {'ad_id': ad_id, 'enabled': '1', 'update_time': datetime.now()})
             await db.commit()
-            return CrudResponseModel(is_success=True, message='启用成功')
+            return CrudResponseModel(is_success=True, message='默认广告词设置成功')
         except Exception as exc:
             await db.rollback()
             raise exc
@@ -580,10 +582,17 @@ class TelegramForwardService:
         source_messages: list[Any] | None = None,
     ) -> list[Any]:
         client = await TelegramClientManager.get_authorized_client(account)
-        ad_text = await TelegramDao.get_enabled_ad_text(db)
+        default_ad_text = await TelegramDao.get_enabled_ad_text(db)
+        target_ad_text_ids = sorted({chat.ad_text_id for chat in target_chats if getattr(chat, 'ad_text_id', None)})
+        target_ad_texts = await TelegramDao.get_ad_texts_by_ids(db, target_ad_text_ids)
+        ad_text_map = {ad_text.ad_id: ad_text.ad_content for ad_text in target_ad_texts}
         clean_rules = await TelegramDao.get_enabled_clean_rules(db)
         medias = await TelegramDao.get_media_by_message_id(db, message.message_id)
         target_chat_ids = [chat.chat_id for chat in target_chats]
+        ad_text_by_target_id = {
+            chat.chat_id: ad_text_map.get(getattr(chat, 'ad_text_id', None), default_ad_text.ad_content if default_ad_text else None)
+            for chat in target_chats
+        }
         cleaned_message_text = ContentCleanPolicy.apply(message.message_text, clean_rules)
         dispatcher = ForwardDispatcher(client)
         if medias:
@@ -597,7 +606,7 @@ class TelegramForwardService:
                     target_chat_ids,
                     complete_source_media_messages,
                     cleaned_message_text,
-                    ad_text.ad_content if ad_text else None,
+                    ad_text_by_target_id,
                     forward_type,
                 )
                 failed_results = [result for result in results if result.status != 'success']
@@ -609,7 +618,7 @@ class TelegramForwardService:
                             [result.target_chat_id for result in failed_results],
                             file_paths,
                             cleaned_message_text,
-                            ad_text.ad_content if ad_text else None,
+                            ad_text_by_target_id,
                             forward_type,
                         )
                         retry_map = {result.target_chat_id: result for result in retry_results}
@@ -622,7 +631,7 @@ class TelegramForwardService:
                         target_chat_ids,
                         file_paths,
                         cleaned_message_text,
-                        ad_text.ad_content if ad_text else None,
+                        ad_text_by_target_id,
                         forward_type,
                     )
                 else:
@@ -632,7 +641,7 @@ class TelegramForwardService:
                 message.message_id,
                 target_chat_ids,
                 cleaned_message_text,
-                ad_text.ad_content if ad_text else None,
+                ad_text_by_target_id,
                 forward_type,
             )
         chat_map = {chat.chat_id: chat for chat in target_chats}

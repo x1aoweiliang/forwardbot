@@ -62,6 +62,12 @@ class TelegramDao:
         return (await db.execute(select(TgAdText).where(TgAdText.enabled == '1').order_by(TgAdText.ad_id))).scalars().first()
 
     @classmethod
+    async def get_ad_texts_by_ids(cls, db: AsyncSession, ad_ids: list[int]) -> list[TgAdText]:
+        if not ad_ids:
+            return []
+        return (await db.execute(select(TgAdText).where(TgAdText.ad_id.in_(ad_ids)))).scalars().all()
+
+    @classmethod
     async def get_enabled_clean_rules(cls, db: AsyncSession) -> list[TgContentCleanRule]:
         return (
             (await db.execute(select(TgContentCleanRule).where(TgContentCleanRule.status == '0').order_by(TgContentCleanRule.clean_id)))

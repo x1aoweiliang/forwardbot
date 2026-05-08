@@ -66,6 +66,7 @@ def upgrade() -> None:  # noqa: PLR0912
             sa.Column('chat_type', sa.String(length=30), nullable=False, comment='类型：group/channel/private'),
             sa.Column('can_listen', sa.CHAR(length=1), server_default='N', nullable=False, comment='是否可监听'),
             sa.Column('can_send', sa.CHAR(length=1), server_default='N', nullable=False, comment='是否可发送'),
+            sa.Column('ad_text_id', sa.BigInteger(), nullable=True, comment='目标群广告词ID'),
             sa.Column('status', sa.CHAR(length=1), server_default='0', nullable=False, comment='状态（0启用 1停用）'),
             sa.Column('create_by', sa.String(length=64), server_default='', nullable=True, comment='创建者'),
             sa.Column('create_time', sa.DateTime(), nullable=True, comment='创建时间'),
@@ -100,6 +101,8 @@ def upgrade() -> None:  # noqa: PLR0912
             'tg_listener_rule',
             sa.Column('source_chat_pks', sa.String(length=1000), nullable=True, comment='来源频道主键，逗号分隔'),
         )
+    if _has_table('tg_chat') and not _has_column('tg_chat', 'ad_text_id'):
+        op.add_column('tg_chat', sa.Column('ad_text_id', sa.BigInteger(), nullable=True, comment='目标群广告词ID'))
 
     if not _has_table('tg_sensitive_word'):
         op.create_table(

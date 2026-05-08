@@ -30,6 +30,7 @@ create table if not exists tg_chat (
     chat_type varchar(30) not null,
     can_listen char(1) not null default 'N',
     can_send char(1) not null default 'N',
+    ad_text_id bigint,
     status char(1) not null default '0',
     create_by varchar(64) default '',
     create_time timestamp,

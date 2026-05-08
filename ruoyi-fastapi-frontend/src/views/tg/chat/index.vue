@@ -45,6 +45,7 @@
       <el-table-column label="类型" width="100"><template #default="scope">{{ optionLabel(chatTypeOptions, scope.row.chatType) }}</template></el-table-column>
       <el-table-column label="监听" width="80"><template #default="scope">{{ optionLabel(yesNoOptions, scope.row.canListen) }}</template></el-table-column>
       <el-table-column label="发送" width="80"><template #default="scope">{{ optionLabel(yesNoOptions, scope.row.canSend) }}</template></el-table-column>
+      <el-table-column label="广告词" width="160"><template #default="scope">{{ adTextName(scope.row.adTextId) }}</template></el-table-column>
       <el-table-column label="状态" width="80"><template #default="scope">{{ optionLabel(statusOptions, scope.row.status) }}</template></el-table-column>
       <el-table-column label="操作" width="210"><template #default="scope"><el-button link type="primary" icon="Message" :disabled="scope.row.canSend !== 'Y'" @click="openSend(scope.row)">发送</el-button><el-button link type="primary" icon="Edit" @click="handleUpdate(scope.row)">修改</el-button><el-button link type="primary" icon="Delete" @click="handleDelete(scope.row)">删除</el-button></template></el-table-column>
     </el-table>
@@ -61,6 +62,11 @@
         <el-form-item label="用户名"><el-input v-model="form.username" /></el-form-item>
         <el-form-item label="类型"><el-radio-group v-model="form.chatType"><el-radio v-for="item in chatTypeOptions" :key="item.value" :label="item.value">{{ item.label }}</el-radio></el-radio-group></el-form-item>
         <el-form-item label="权限"><el-checkbox v-model="listenChecked">可监听</el-checkbox><el-checkbox v-model="sendChecked">可发送</el-checkbox></el-form-item>
+        <el-form-item label="广告词">
+          <el-select v-model="form.adTextId" clearable filterable style="width: 100%">
+            <el-option v-for="item in adTextOptions" :key="item.adId" :label="item.adName" :value="item.adId" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="状态"><el-radio-group v-model="form.status"><el-radio label="0">启用</el-radio><el-radio label="1">停用</el-radio></el-radio-group></el-form-item>
       </el-form>
       <template #footer><el-button type="primary" @click="submitForm">确定</el-button><el-button @click="open = false">取消</el-button></template>
@@ -76,12 +82,13 @@
 </template>
 
 <script setup>
-import { accountApi, chatApi } from "@/api/tg";
+import { accountApi, adTextApi, chatApi } from "@/api/tg";
 const { proxy } = getCurrentInstance();
 const rows = ref([]), ids = ref([]), loading = ref(false), showSearch = ref(true), total = ref(0), open = ref(false), sendOpen = ref(false), multiple = ref(true);
 const title = ref("");
 const listenChecked = ref(false), sendChecked = ref(false);
 const accountOptions = ref([]);
+const adTextOptions = ref([]);
 const chatTypeOptions = [{ label: "频道", value: "channel" }, { label: "群组", value: "group" }, { label: "私聊", value: "private" }];
 const yesNoOptions = [{ label: "是", value: "Y" }, { label: "否", value: "N" }];
 const statusOptions = [{ label: "启用", value: "0" }, { label: "停用", value: "1" }];
@@ -95,9 +102,11 @@ const data = reactive({
 const { queryParams, form, sendForm, rules, sendRules } = toRefs(data);
 function getList() { loading.value = true; chatApi.list(queryParams.value).then((res) => { rows.value = res.rows; total.value = res.total; loading.value = false; }); }
 function getAccountOptions() { accountApi.list({ pageNum: 1, pageSize: 1000, status: "0" }).then((res) => { accountOptions.value = res.rows || []; }); }
+function getAdTextOptions() { adTextApi.list({ pageNum: 1, pageSize: 1000 }).then((res) => { adTextOptions.value = res.rows || []; }); }
 function optionLabel(options, value) { return options.find((item) => item.value === value)?.label || value || "-"; }
 function accountName(accountId) { return accountOptions.value.find((item) => item.accountId === accountId)?.accountName || accountId || "-"; }
-function reset() { form.value = { chatPk: undefined, accountId: undefined, chatId: undefined, chatTitle: undefined, username: undefined, chatType: "channel", canListen: "N", canSend: "N", status: "0" }; listenChecked.value = false; sendChecked.value = false; proxy.resetForm("formRef"); }
+function adTextName(adTextId) { return adTextOptions.value.find((item) => item.adId === adTextId)?.adName || "-"; }
+function reset() { form.value = { chatPk: undefined, accountId: undefined, chatId: undefined, chatTitle: undefined, username: undefined, chatType: "channel", canListen: "N", canSend: "N", adTextId: undefined, status: "0" }; listenChecked.value = false; sendChecked.value = false; proxy.resetForm("formRef"); }
 function handleQuery() { queryParams.value.pageNum = 1; getList(); }
 function resetQuery() { proxy.resetForm("queryRef"); handleQuery(); }
 function handleSelectionChange(selection) { ids.value = selection.map((item) => item.chatPk); multiple.value = !selection.length; }
@@ -109,5 +118,6 @@ function syncDialogs() { chatApi.sync(queryParams.value.accountId).then((res) =>
 function openSend(row) { sendForm.value = { chatPk: row.chatPk, chatTitle: row.chatTitle, text: "" }; sendOpen.value = true; }
 function submitSend() { proxy.$refs.sendFormRef.validate((valid) => { if (!valid) return; chatApi.sendMessage({ chatPk: sendForm.value.chatPk, text: sendForm.value.text }).then((res) => { proxy.$modal.msgSuccess(res.msg); sendOpen.value = false; }); }); }
 getAccountOptions();
+getAdTextOptions();
 getList();
 </script>

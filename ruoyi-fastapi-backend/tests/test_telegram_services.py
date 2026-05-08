@@ -74,14 +74,11 @@ def test_account_detail_sanitizer_hides_api_hash_and_session_path() -> None:
     assert sanitized.session_path is None
 
 
-def test_ad_text_policy_allows_only_one_enabled_ad() -> None:
+def test_ad_text_policy_allows_ad_templates_to_be_assigned_independently() -> None:
     enabled = SimpleNamespace(ad_id=1, enabled='1')
-    disabled = SimpleNamespace(ad_id=2, enabled='0')
+    another_enabled = SimpleNamespace(ad_id=2, enabled='1')
 
-    assert AdTextPolicy.validate_single_enabled([enabled, disabled]) is True
-
-    with pytest.raises(ValueError, match='只能启用一个广告词'):
-        AdTextPolicy.validate_single_enabled([enabled, SimpleNamespace(ad_id=3, enabled='1')])
+    assert AdTextPolicy.validate_single_enabled([enabled, another_enabled]) is True
 
 
 def test_ad_text_policy_separates_ad_with_two_blank_lines() -> None:
@@ -1089,6 +1086,67 @@ def test_forward_service_cleans_content_before_appending_ad(monkeypatch: pytest.
     asyncio.run(run_case())
 
 
+def test_forward_service_uses_target_chat_ad_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        sent_messages = []
+        records = []
+
+        class FakeClient:
+            async def send_message(self, target_chat_id: str, text: str, link_preview: bool = False) -> SimpleNamespace:
+                sent_messages.append((target_chat_id, text, link_preview))
+                return SimpleNamespace(id=102)
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_enabled_ad_text(db: object) -> SimpleNamespace:
+            return SimpleNamespace(ad_id=1, ad_content='默认广告')
+
+        async def fake_get_ad_texts_by_ids(db: object, ad_ids: list[int]) -> list:
+            assert ad_ids == [2, 3]
+            return [
+                SimpleNamespace(ad_id=2, ad_content='A群广告'),
+                SimpleNamespace(ad_id=3, ad_content='B群广告'),
+            ]
+
+        async def fake_get_enabled_clean_rules(db: object) -> list:
+            return []
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return []
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_ad_text', fake_get_enabled_ad_text)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_ad_texts_by_ids', fake_get_ad_texts_by_ids)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_clean_rules', fake_get_enabled_clean_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+
+        await TelegramForwardService.forward_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=11, message_text='原始消息'),
+            target_chats=[
+                SimpleNamespace(chat_pk=3, chat_id='target-a', chat_title='Target A', ad_text_id=2),
+                SimpleNamespace(chat_pk=4, chat_id='target-b', chat_title='Target B', ad_text_id=3),
+                SimpleNamespace(chat_pk=5, chat_id='target-c', chat_title='Target C', ad_text_id=None),
+            ],
+            forward_type='manual',
+        )
+
+        assert sent_messages == [
+            ('target-a', '原始消息\n\n\nA群广告', False),
+            ('target-b', '原始消息\n\n\nB群广告', False),
+            ('target-c', '原始消息\n\n\n默认广告', False),
+        ]
+        assert [record['status'] for record in records] == ['success', 'success', 'success']
+
+    asyncio.run(run_case())
+
+
 def test_save_rule_normalizes_multiple_source_chats(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_case() -> None:
         stored_payloads = []
@@ -1123,6 +1181,47 @@ def test_save_rule_normalizes_multiple_source_chats(monkeypatch: pytest.MonkeyPa
         expected_source_chat_pk = 2
         assert stored_payloads[0]['source_chat_pk'] == expected_source_chat_pk
         assert stored_payloads[0]['source_chat_pks'] == '2,3'
+
+    asyncio.run(run_case())
+
+
+def test_save_chat_allows_clearing_ad_text_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        stored_payloads = []
+
+        class FakeDb:
+            async def commit(self) -> None:
+                return None
+
+            async def rollback(self) -> None:
+                return None
+
+        async def fake_update_item(db: object, model: type, data: dict) -> None:
+            stored_payloads.append(data)
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_item', fake_update_item)
+
+        result = await TelegramCrudService.save_chat(
+            FakeDb(),
+            SimpleNamespace(
+                ad_text_id=None,
+                model_fields_set={'chat_pk', 'chat_title', 'ad_text_id'},
+                model_dump=lambda exclude_unset, exclude_none: {
+                    'chat_pk': 8,
+                    'chat_title': 'Target',
+                },
+            ),
+        )
+
+        assert result.is_success is True
+        assert stored_payloads == [
+            {
+                'chat_pk': 8,
+                'chat_title': 'Target',
+                'ad_text_id': None,
+                'update_time': stored_payloads[0]['update_time'],
+            }
+        ]
 
     asyncio.run(run_case())
 
