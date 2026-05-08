@@ -40,7 +40,16 @@ def upgrade() -> None:
             'tg_listener_rule',
             sa.Column('source_chat_pks', sa.String(length=1000), nullable=True, comment='来源频道主键，逗号分隔'),
         )
-    op.execute("update tg_listener_rule set source_chat_pks = source_chat_pk::text where source_chat_pks is null or source_chat_pks = ''")
+    listener_rule = sa.table(
+        'tg_listener_rule',
+        sa.column('source_chat_pk', sa.BigInteger()),
+        sa.column('source_chat_pks', sa.String(length=1000)),
+    )
+    op.execute(
+        listener_rule.update()
+        .where(sa.or_(listener_rule.c.source_chat_pks.is_(None), listener_rule.c.source_chat_pks == ''))
+        .values(source_chat_pks=sa.cast(listener_rule.c.source_chat_pk, sa.String(length=1000)))
+    )
 
 
 def downgrade() -> None:

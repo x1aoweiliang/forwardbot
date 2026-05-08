@@ -330,7 +330,7 @@ def test_ingest_event_normalizes_aware_sent_at(monkeypatch: pytest.MonkeyPatch) 
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_words', fake_get_enabled_words)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
-        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', FakeStorage)
 
         event = SimpleNamespace(
             message=SimpleNamespace(id=2, message='normal', text='normal', date=datetime(2026, 5, 2, 10, 0, tzinfo=UTC)),
@@ -353,6 +353,9 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
         stored_messages = []
         stored_medias = []
         forward_calls = []
+        db_message_id = 200
+        first_message_id = 10
+        media_count = 2
 
         class FakeDb:
             async def flush(self) -> None:
@@ -363,7 +366,7 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
 
         async def fake_add_message(db: object, data: dict) -> SimpleNamespace:
             stored_messages.append(data)
-            return SimpleNamespace(message_id=200, **data)
+            return SimpleNamespace(message_id=db_message_id, **data)
 
         async def fake_add_media(db: object, data: dict) -> None:
             stored_medias.append(data)
@@ -386,7 +389,7 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
 
         event = SimpleNamespace(
             messages=[
-                SimpleNamespace(id=10, message='caption', text='caption', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg')),
+                SimpleNamespace(id=first_message_id, message='caption', text='caption', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg')),
                 SimpleNamespace(id=11, message='', text='', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg')),
             ]
         )
@@ -397,15 +400,92 @@ def test_ingest_album_stores_multiple_media_under_one_message(monkeypatch: pytes
             event,
         )
 
-        assert result.message_id == 200
+        assert result.message_id == db_message_id
         assert len(stored_messages) == 1
-        assert stored_messages[0]['telegram_message_id'] == 10
+        assert stored_messages[0]['telegram_message_id'] == first_message_id
         assert stored_messages[0]['message_text'] == 'caption'
-        assert len(stored_medias) == 2
+        assert len(stored_medias) == media_count
         assert [media['local_path'] for media in stored_medias] == ['', '']
         assert [media['source_telegram_message_id'] for media in stored_medias] == [10, 11]
         assert [media['media_index'] for media in stored_medias] == [0, 1]
         assert len(forward_calls) == 1
+
+    asyncio.run(run_case())
+
+
+def test_ingest_album_records_large_video_media_even_when_auto_forward_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        stored_messages = []
+        stored_medias = []
+        update_calls = []
+        db_message_id = 202
+        expected_media_count = 3
+        large_video_size = 300 * 1024 * 1024
+
+        class FakeDb:
+            async def flush(self) -> None:
+                return None
+
+        async def fake_get_enabled_words(db: object) -> list:
+            return []
+
+        async def fake_add_message(db: object, data: dict) -> SimpleNamespace:
+            stored_messages.append(data)
+            return SimpleNamespace(message_id=db_message_id, **data)
+
+        async def fake_add_media(db: object, data: dict) -> None:
+            stored_medias.append(data)
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return [SimpleNamespace(source_chat_pk=2, target_chat_pks='3')]
+
+        async def fake_get_chats(db: object, chat_pks: list[int]) -> list:
+            return [SimpleNamespace(chat_pk=3, chat_id='target', chat_title='Target')]
+
+        async def fake_forward_to_chats(*args: object, **kwargs: object) -> None:
+            raise RuntimeError('send failed after ingest')
+
+        async def fake_update_message(db: object, data: dict) -> None:
+            update_calls.append(data)
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_words', fake_get_enabled_words)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_media', fake_add_media)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_message', fake_update_message)
+        monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
+
+        event = SimpleNamespace(
+            messages=[
+                SimpleNamespace(id=10, message='caption', text='caption', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg', size=123)),
+                SimpleNamespace(id=11, message='', text='', date=None, media=object(), file=SimpleNamespace(mime_type='image/jpeg', size=456)),
+                SimpleNamespace(
+                    id=12,
+                    message='',
+                    text='',
+                    date=None,
+                    media=object(),
+                    file=SimpleNamespace(mime_type='video/mp4', name='large.mp4', size=large_video_size),
+                ),
+            ]
+        )
+
+        result = await TelegramMessageIngestService.ingest_album(
+            FakeDb(),
+            SimpleNamespace(account_id=1),
+            SimpleNamespace(chat_pk=2, chat_id='source', chat_title='Source'),
+            event,
+        )
+
+        assert result.message_id == db_message_id
+        assert len(stored_messages) == 1
+        assert len(stored_medias) == expected_media_count
+        assert [media['source_telegram_message_id'] for media in stored_medias] == [10, 11, 12]
+        assert stored_medias[2]['mime_type'] == 'video/mp4'
+        assert stored_medias[2]['file_size'] == large_video_size
+        assert update_calls[-1]['message_id'] == db_message_id
+        assert update_calls[-1]['auto_forward_status'] == 'partial_failed'
 
     asyncio.run(run_case())
 
@@ -440,7 +520,7 @@ def test_ingest_album_uses_album_caption_when_message_text_is_empty(monkeypatch:
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_media', fake_add_media)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
-        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', FakeStorage)
 
         first_album_message_id = 34073
         album_media_count = 3
@@ -819,7 +899,7 @@ def test_manual_forward_uses_complete_fallback_when_source_album_lookup_is_incom
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_media_local_path', fake_update_media_local_path)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
-        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', FakeStorage)
 
         results = await TelegramForwardService.forward_to_chats(
             db=object(),
@@ -893,7 +973,7 @@ def test_auto_forward_falls_back_to_download_when_source_media_send_fails(monkey
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_media_local_path', fake_update_media_local_path)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
         monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_message', fake_update_message)
-        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', lambda: FakeStorage())
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramStorageService', FakeStorage)
 
         await TelegramForwardService.forward_to_chats(
             db=object(),
@@ -932,6 +1012,29 @@ def test_tg_media_source_reference_migration_sets_local_path_default() -> None:
         args[:2] == ('tg_message_media', 'local_path') and kwargs.get('server_default') == ''
         for args, kwargs in alter_calls
     )
+
+
+def test_listener_rule_source_chat_pks_migration_uses_cross_database_cast() -> None:
+    migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260507_01_add_tg_listener_rule_source_chat_pks.py'
+    spec = importlib.util.spec_from_file_location('tg_listener_rule_source_pks_migration', migration_path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    execute_calls = []
+
+    migration._has_table = lambda table_name: table_name == 'tg_listener_rule'
+    migration._has_column = lambda table_name, column_name: column_name == 'source_chat_pks'
+    def capture_execute(statement: object) -> None:
+        execute_calls.append(statement)
+
+    migration.op.add_column = lambda *args, **kwargs: None
+    migration.op.execute = capture_execute
+
+    migration.upgrade()
+
+    assert execute_calls
+    assert all('::text' not in str(statement) for statement in execute_calls)
+    assert not any(isinstance(statement, str) for statement in execute_calls)
 
 
 def test_forward_service_cleans_content_before_appending_ad(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1017,7 +1120,8 @@ def test_save_rule_normalizes_multiple_source_chats(monkeypatch: pytest.MonkeyPa
         )
 
         assert result.is_success is True
-        assert stored_payloads[0]['source_chat_pk'] == 2
+        expected_source_chat_pk = 2
+        assert stored_payloads[0]['source_chat_pk'] == expected_source_chat_pk
         assert stored_payloads[0]['source_chat_pks'] == '2,3'
 
     asyncio.run(run_case())
@@ -1068,8 +1172,69 @@ def test_auto_forward_matches_any_source_in_rule(monkeypatch: pytest.MonkeyPatch
         )
 
         assert len(forward_calls) == 1
-        assert forward_calls[0][0][0].chat_pk == 8
+        expected_target_chat_pk = 8
+        assert forward_calls[0][0][0].chat_pk == expected_target_chat_pk
         assert forward_calls[0][1] == 'auto'
+
+    asyncio.run(run_case())
+
+
+def test_ingest_event_records_forward_failure_when_auto_forward_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        forward_records = []
+        update_calls = []
+
+        class FakeDb:
+            async def flush(self) -> None:
+                return None
+
+        async def fake_get_enabled_words(db: object) -> list:
+            return []
+
+        async def fake_add_message(db: object, data: dict) -> SimpleNamespace:
+            return SimpleNamespace(message_id=301, **data)
+
+        async def fake_add_media(db: object, data: dict) -> None:
+            return None
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return [SimpleNamespace(source_chat_pk=2, target_chat_pks='8,9')]
+
+        async def fake_get_chats(db: object, chat_pks: list[int]) -> list:
+            return [
+                SimpleNamespace(chat_pk=8, chat_id='target-a', chat_title='Target A'),
+                SimpleNamespace(chat_pk=9, chat_id='target-b', chat_title='Target B'),
+            ]
+
+        async def fake_forward_to_chats(*args: object, **kwargs: object) -> None:
+            raise RuntimeError('client init failed')
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            forward_records.append(data)
+
+        async def fake_update_message(db: object, data: dict) -> None:
+            update_calls.append(data)
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_words', fake_get_enabled_words)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_message', fake_add_message)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_media', fake_add_media)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_message', fake_update_message)
+        monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
+
+        await TelegramMessageIngestService.ingest_event(
+            FakeDb(),
+            SimpleNamespace(account_id=1),
+            SimpleNamespace(chat_pk=2, chat_id='source', chat_title='Source'),
+            SimpleNamespace(message=SimpleNamespace(id=42, message='text', text='text', date=None, media=None), media=None),
+        )
+
+        assert [record['target_chat_id'] for record in forward_records] == ['target-a', 'target-b']
+        assert [record['status'] for record in forward_records] == ['failed', 'failed']
+        assert all(record['error_message'] == 'client init failed' for record in forward_records)
+        assert update_calls[-1]['auto_forward_status'] == 'partial_failed'
 
     asyncio.run(run_case())
 
@@ -1104,8 +1269,60 @@ def test_start_listener_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
         await TelegramClientManager.start_listener(object(), account)
         await TelegramClientManager.start_listener(object(), account)
 
-        assert [builder[0] for _, builder in added_handlers] == ['new', 'album']
-        assert len(TelegramClientManager._handlers[1]) == 2
+        assert [builder[0] for _, builder in added_handlers] == ['new']
+        assert len(TelegramClientManager._handlers[1]) == 1
+
+    asyncio.run(run_case())
+
+
+def test_grouped_new_messages_flush_as_complete_album(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        ingest_calls = []
+        expected_album_count = 3
+        large_video_size = 300 * 1024 * 1024
+
+        class FakeDb:
+            async def __aenter__(self) -> "FakeDb":
+                return self
+
+            async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+                return None
+
+            async def commit(self) -> None:
+                return None
+
+            async def rollback(self) -> None:
+                return None
+
+        class FakeSessionFactory:
+            def __call__(self) -> FakeDb:
+                return FakeDb()
+
+        async def fake_ingest_album(db: object, account: object, source_chat: object, event: object) -> None:
+            ingest_calls.append((account, source_chat, event))
+
+        monkeypatch.setattr('config.database.AsyncSessionLocal', FakeSessionFactory())
+        monkeypatch.setattr(TelegramMessageIngestService, 'ingest_album', staticmethod(fake_ingest_album))
+        TelegramClientManager._album_buffers.clear()
+        TelegramClientManager._album_flush_tasks.clear()
+
+        account = SimpleNamespace(account_id=1)
+        source_chat = SimpleNamespace(chat_pk=2, chat_id='source', chat_title='Source')
+        messages = [
+            SimpleNamespace(id=12, grouped_id=777, message='', text='', media=object(), file=SimpleNamespace(mime_type='video/mp4', size=large_video_size)),
+            SimpleNamespace(id=10, grouped_id=777, message='caption', text='caption', media=object(), file=SimpleNamespace(mime_type='image/jpeg', size=123)),
+            SimpleNamespace(id=11, grouped_id=777, message='', text='', media=object(), file=SimpleNamespace(mime_type='image/jpeg', size=456)),
+        ]
+
+        for message in messages:
+            TelegramClientManager._queue_grouped_message(account, source_chat, SimpleNamespace(message=message))
+        await TelegramClientManager._flush_grouped_album((1, 2, 777), account, source_chat)
+
+        assert len(ingest_calls) == 1
+        flushed_event = ingest_calls[0][2]
+        assert [message.id for message in flushed_event.messages] == [10, 11, 12]
+        assert len(flushed_event.messages) == expected_album_count
+        assert flushed_event.messages[2].file.mime_type == 'video/mp4'
 
     asyncio.run(run_case())
 
@@ -1148,11 +1365,8 @@ def test_start_listener_registers_all_sources_from_multi_source_rules(monkeypatc
 
         assert added_builders == [
             ('new', 'source-a'),
-            ('album', 'source-a'),
             ('new', 'source-b'),
-            ('album', 'source-b'),
             ('new', 'source-c'),
-            ('album', 'source-c'),
         ]
 
     asyncio.run(run_case())

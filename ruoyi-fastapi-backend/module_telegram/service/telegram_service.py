@@ -795,7 +795,26 @@ class TelegramMessageIngestService:
         for rule in matched_rules:
             target_pks = ListenerRulePolicy.parse_chat_pks(rule.target_chat_pks)
             targets = await TelegramDao.get_chats_by_pks(db, target_pks)
-            await TelegramForwardService.forward_to_chats(db, account, db_message, targets, 'auto', source_messages=source_messages)
+            try:
+                await TelegramForwardService.forward_to_chats(db, account, db_message, targets, 'auto', source_messages=source_messages)
+            except Exception as exc:
+                for target in targets:
+                    await TelegramDao.add_forward_record(
+                        db,
+                        {
+                            'message_id': db_message.message_id,
+                            'account_id': account.account_id,
+                            'target_chat_pk': target.chat_pk,
+                            'target_chat_id': target.chat_id,
+                            'target_chat_title': target.chat_title,
+                            'forward_type': 'auto',
+                            'status': 'failed',
+                            'sent_telegram_message_id': None,
+                            'error_message': str(exc),
+                            'create_time': datetime.now(),
+                        },
+                    )
+                raise
 
     @classmethod
     async def ingest_event(cls, db: AsyncSession, account: TgAccount, source_chat: TgChat, event: Any) -> TgMessage:
@@ -823,7 +842,17 @@ class TelegramMessageIngestService:
         await cls._save_message_medias(db, db_message, [event.message])
         if match_result.is_blocked:
             return db_message
-        await cls._forward_source_message_by_rules(db, account, source_chat, db_message, [event.message])
+        try:
+            await cls._forward_source_message_by_rules(db, account, source_chat, db_message, [event.message])
+        except Exception:
+            await TelegramDao.update_message(
+                db,
+                {
+                    'message_id': db_message.message_id,
+                    'auto_forward_status': 'partial_failed',
+                    'update_time': datetime.now(),
+                },
+            )
         return db_message
 
     @classmethod
@@ -856,5 +885,15 @@ class TelegramMessageIngestService:
         await cls._save_message_medias(db, db_message, messages)
         if match_result.is_blocked:
             return db_message
-        await cls._forward_source_message_by_rules(db, account, source_chat, db_message, messages)
+        try:
+            await cls._forward_source_message_by_rules(db, account, source_chat, db_message, messages)
+        except Exception:
+            await TelegramDao.update_message(
+                db,
+                {
+                    'message_id': db_message.message_id,
+                    'auto_forward_status': 'partial_failed',
+                    'update_time': datetime.now(),
+                },
+            )
         return db_message

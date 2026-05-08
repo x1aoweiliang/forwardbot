@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +39,9 @@ class TelegramClientManager:
 
     _clients: dict[int, Any] = {}
     _handlers: dict[int, list[Any]] = {}
+    _album_buffers: dict[tuple[int, int, int], dict[int, Any]] = {}
+    _album_flush_tasks: dict[tuple[int, int, int], asyncio.Task] = {}
+    _album_flush_delay = 5.0
     _session_dir = Path('vf_admin/telegram_sessions')
 
     @classmethod
@@ -180,10 +184,81 @@ class TelegramClientManager:
 
     @classmethod
     async def disconnect(cls, account_id: int) -> None:
+        await cls._cancel_album_flush_tasks(account_id)
         client = cls._clients.pop(account_id, None)
         if client:
             await client.disconnect()
         cls._handlers.pop(account_id, None)
+
+    @classmethod
+    def _album_buffer_key(cls, account: TgAccount, source_chat: Any, grouped_id: Any) -> tuple[int, int, int]:
+        return (int(account.account_id), int(source_chat.chat_pk), int(grouped_id))
+
+    @classmethod
+    def _queue_grouped_message(cls, account: TgAccount, source_chat: Any, event: Any) -> None:
+        grouped_id = getattr(event.message, 'grouped_id', None)
+        if grouped_id is None:
+            return
+        key = cls._album_buffer_key(account, source_chat, grouped_id)
+        message_id = getattr(event.message, 'id', None)
+        if message_id is None:
+            return
+        cls._album_buffers.setdefault(key, {})[int(message_id)] = event.message
+        existing_task = cls._album_flush_tasks.get(key)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+        cls._album_flush_tasks[key] = asyncio.create_task(cls._flush_grouped_album_after_delay(key, account, source_chat))
+
+    @classmethod
+    async def _flush_grouped_album_after_delay(cls, key: tuple[int, int, int], account: TgAccount, source_chat: Any) -> None:
+        try:
+            await asyncio.sleep(cls._album_flush_delay)
+            await cls._flush_grouped_album(key, account, source_chat)
+        except asyncio.CancelledError:
+            raise
+
+    @classmethod
+    async def _flush_grouped_album(cls, key: tuple[int, int, int], account: TgAccount, source_chat: Any) -> None:
+        pending_task = cls._album_flush_tasks.pop(key, None)
+        if pending_task and pending_task is not asyncio.current_task() and not pending_task.done():
+            pending_task.cancel()
+        buffered_messages = cls._album_buffers.pop(key, {})
+        messages = sorted(buffered_messages.values(), key=lambda message: getattr(message, 'id', 0) or 0)
+        if not messages:
+            return
+
+        from config.database import AsyncSessionLocal  # noqa: PLC0415
+        from module_telegram.service.telegram_service import TelegramMessageIngestService  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as handler_db:
+            try:
+                album_event = SimpleNamespace(
+                    messages=messages,
+                    raw_text=next((getattr(message, 'raw_text', None) for message in messages if getattr(message, 'raw_text', None)), None),
+                    text=next((getattr(message, 'text', None) for message in messages if getattr(message, 'text', None)), None),
+                )
+                await TelegramMessageIngestService.ingest_album(handler_db, account, source_chat, album_event)
+                await handler_db.commit()
+            except Exception as exc:
+                await handler_db.rollback()
+                logger.exception(
+                    f'Telegram聚合相册消息处理失败: account_id={account.account_id}, chat_id={source_chat.chat_id}, '
+                    f'grouped_id={key[2]}, error={exc}'
+                )
+
+    @classmethod
+    async def _cancel_album_flush_tasks(cls, account_id: int | None = None) -> None:
+        tasks = []
+        for key, task in list(cls._album_flush_tasks.items()):
+            if account_id is not None and key[0] != account_id:
+                continue
+            cls._album_flush_tasks.pop(key, None)
+            cls._album_buffers.pop(key, None)
+            if not task.done():
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @classmethod
     async def reload_listener(cls, db: AsyncSession, account: TgAccount) -> None:
@@ -209,6 +284,7 @@ class TelegramClientManager:
 
             async def handler(event: Any, chat: Any = source_chat) -> None:
                 if getattr(event.message, 'grouped_id', None):
+                    cls._queue_grouped_message(account, chat, event)
                     return
                 from config.database import AsyncSessionLocal  # noqa: PLC0415
                 from module_telegram.service.telegram_service import TelegramMessageIngestService  # noqa: PLC0415
@@ -221,24 +297,9 @@ class TelegramClientManager:
                         await handler_db.rollback()
                         logger.exception(f'Telegram消息处理失败: account_id={account.account_id}, chat_id={chat.chat_id}, error={exc}')
 
-            async def album_handler(event: Any, chat: Any = source_chat) -> None:
-                from config.database import AsyncSessionLocal  # noqa: PLC0415
-                from module_telegram.service.telegram_service import TelegramMessageIngestService  # noqa: PLC0415
-
-                async with AsyncSessionLocal() as handler_db:
-                    try:
-                        await TelegramMessageIngestService.ingest_album(handler_db, account, chat, event)
-                        await handler_db.commit()
-                    except Exception as exc:
-                        await handler_db.rollback()
-                        logger.exception(f'Telegram相册消息处理失败: account_id={account.account_id}, chat_id={chat.chat_id}, error={exc}')
-
             builder = events.NewMessage(chats=cls._normalize_chat_ref(source_chat.chat_id))
-            album_builder = events.Album(chats=cls._normalize_chat_ref(source_chat.chat_id))
             client.add_event_handler(handler, builder)
-            client.add_event_handler(album_handler, album_builder)
             cls._handlers[account.account_id].append((handler, builder))
-            cls._handlers[account.account_id].append((album_handler, album_builder))
             logger.info(f'Telegram监听已启动: account_id={account.account_id}, chat_id={source_chat.chat_id}')
 
     @classmethod
@@ -252,6 +313,7 @@ class TelegramClientManager:
 
     @classmethod
     async def stop_all(cls) -> None:
+        await cls._cancel_album_flush_tasks()
         await asyncio.gather(*(client.disconnect() for client in cls._clients.values()), return_exceptions=True)
         cls._clients.clear()
         cls._handlers.clear()
