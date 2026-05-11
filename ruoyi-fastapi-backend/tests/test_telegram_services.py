@@ -990,6 +990,154 @@ def test_auto_forward_falls_back_to_download_when_source_media_send_fails(monkey
     asyncio.run(run_case())
 
 
+def test_native_hidden_forward_uses_telegram_forward_without_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        forward_calls = []
+        records = []
+
+        class FakeClient:
+            async def forward_messages(
+                self,
+                target_chat_id: str,
+                message_ids: list[int],
+                from_peer: str,
+                drop_author: bool,
+                drop_media_captions: bool,
+            ) -> list[SimpleNamespace]:
+                forward_calls.append((target_chat_id, message_ids, from_peer, drop_author, drop_media_captions))
+                return [SimpleNamespace(id=701), SimpleNamespace(id=702), SimpleNamespace(id=703)]
+
+            async def send_file(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError('native hidden forwarding must not use send_file')
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [
+                SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path=''),
+                SimpleNamespace(media_id=2, source_telegram_message_id=43, media_index=1, local_path=''),
+                SimpleNamespace(media_id=3, source_telegram_message_id=44, media_index=2, local_path=''),
+            ]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        async def fake_update_message(db: object, data: dict) -> None:
+            records.append({'updated_status': data['auto_forward_status']})
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_message', fake_update_message)
+        monkeypatch.setattr(
+            'module_telegram.service.telegram_service.TelegramStorageService',
+            lambda: (_ for _ in ()).throw(AssertionError('native hidden forwarding must not download media')),
+        )
+
+        results = await TelegramForwardService.forward_native_hidden_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='-1001234567890', telegram_message_id=42),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='auto',
+        )
+
+        assert forward_calls == [('target', [42, 43, 44], -1001234567890, True, False)]
+        assert [result.status for result in results] == ['success']
+        assert records[0]['status'] == 'success'
+        assert records[-1] == {'updated_status': 'success'}
+
+    asyncio.run(run_case())
+
+
+def test_native_hidden_forward_records_failure_without_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        records = []
+
+        class FakeClient:
+            async def forward_messages(self, *args: object, **kwargs: object) -> None:
+                raise RuntimeError('forward forbidden')
+
+            async def send_file(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError('native hidden forwarding must not fall back to send_file')
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path='')]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        async def fake_update_message(db: object, data: dict) -> None:
+            records.append({'updated_status': data['auto_forward_status']})
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.update_message', fake_update_message)
+        monkeypatch.setattr(
+            'module_telegram.service.telegram_service.TelegramStorageService',
+            lambda: (_ for _ in ()).throw(AssertionError('native hidden forwarding must not download media')),
+        )
+
+        results = await TelegramForwardService.forward_native_hidden_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', telegram_message_id=42),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='auto',
+        )
+
+        assert [result.status for result in results] == ['failed']
+        assert results[0].error_message == 'forward forbidden'
+        assert records[0]['status'] == 'failed'
+        assert records[-1] == {'updated_status': 'partial_failed'}
+
+    asyncio.run(run_case())
+
+
+def test_native_hidden_forward_does_not_send_partial_album_without_source_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        records = []
+
+        class FakeClient:
+            async def forward_messages(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError('partial native album should not be forwarded')
+
+        async def fake_get_authorized_client(cls: type, account: SimpleNamespace) -> FakeClient:
+            return FakeClient()
+
+        async def fake_get_media_by_message_id(db: object, message_id: int) -> list:
+            return [
+                SimpleNamespace(media_id=1, source_telegram_message_id=42, media_index=0, local_path=''),
+                SimpleNamespace(media_id=2, source_telegram_message_id=None, media_index=1, local_path='tg/1/10/legacy.mp4'),
+            ]
+
+        async def fake_add_forward_record(db: object, data: dict) -> None:
+            records.append(data)
+
+        monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', classmethod(fake_get_authorized_client))
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_media_by_message_id', fake_get_media_by_message_id)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.add_forward_record', fake_add_forward_record)
+
+        results = await TelegramForwardService.forward_native_hidden_to_chats(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            message=SimpleNamespace(message_id=10, source_chat_id='source-chat', telegram_message_id=42),
+            target_chats=[SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')],
+            forward_type='manual',
+        )
+
+        assert [result.status for result in results] == ['failed']
+        assert results[0].error_message == '源消息不可用'
+        assert records[0]['status'] == 'failed'
+
+    asyncio.run(run_case())
+
+
 def test_tg_media_source_reference_migration_sets_local_path_default() -> None:
     migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260506_01_add_tg_media_source_reference.py'
     spec = importlib.util.spec_from_file_location('tg_media_source_reference_migration', migration_path)
@@ -1032,6 +1180,27 @@ def test_listener_rule_source_chat_pks_migration_uses_cross_database_cast() -> N
     assert execute_calls
     assert all('::text' not in str(statement) for statement in execute_calls)
     assert not any(isinstance(statement, str) for statement in execute_calls)
+
+
+def test_listener_rule_forward_mode_migration_adds_default_column() -> None:
+    migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260511_01_add_tg_listener_rule_forward_mode.py'
+    spec = importlib.util.spec_from_file_location('tg_listener_rule_forward_mode_migration', migration_path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    add_calls = []
+
+    migration._has_table = lambda table_name: table_name == 'tg_listener_rule'
+    migration._has_column = lambda table_name, column_name: False
+    migration.op.add_column = lambda *args, **kwargs: add_calls.append((args, kwargs))
+
+    migration.upgrade()
+
+    assert add_calls
+    column = add_calls[0][0][1]
+    assert add_calls[0][0][0] == 'tg_listener_rule'
+    assert column.name == 'forward_mode'
+    assert str(column.server_default.arg) == 'copy_clean'
 
 
 def test_forward_service_cleans_content_before_appending_ad(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1274,6 +1443,105 @@ def test_auto_forward_matches_any_source_in_rule(monkeypatch: pytest.MonkeyPatch
         expected_target_chat_pk = 8
         assert forward_calls[0][0][0].chat_pk == expected_target_chat_pk
         assert forward_calls[0][1] == 'auto'
+
+    asyncio.run(run_case())
+
+
+def test_auto_forward_routes_native_hidden_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        native_calls = []
+        copy_calls = []
+
+        async def fake_get_rules(db: object, account_id: int) -> list:
+            return [
+                SimpleNamespace(source_chat_pk=2, source_chat_pks='2', target_chat_pks='8', forward_mode='native_hidden'),
+                SimpleNamespace(source_chat_pk=2, source_chat_pks='2', target_chat_pks='9', forward_mode='copy_clean'),
+            ]
+
+        async def fake_get_chats(db: object, chat_pks: list[int]) -> list:
+            return [SimpleNamespace(chat_pk=chat_pk, chat_id=f'target-{chat_pk}', chat_title=f'Target {chat_pk}') for chat_pk in chat_pks]
+
+        async def fake_forward_to_chats(
+            cls: type,
+            db: object,
+            account: object,
+            message: object,
+            targets: list,
+            forward_type: str,
+            source_messages: list | None = None,
+        ) -> None:
+            copy_calls.append(([target.chat_pk for target in targets], forward_type, source_messages))
+
+        async def fake_forward_native_hidden_to_chats(
+            cls: type,
+            db: object,
+            account: object,
+            message: object,
+            targets: list,
+            forward_type: str,
+        ) -> None:
+            native_calls.append(([target.chat_pk for target in targets], forward_type))
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_enabled_rules_for_account', fake_get_rules)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats)
+        monkeypatch.setattr(TelegramForwardService, 'forward_to_chats', classmethod(fake_forward_to_chats))
+        monkeypatch.setattr(TelegramForwardService, 'forward_native_hidden_to_chats', classmethod(fake_forward_native_hidden_to_chats))
+
+        await TelegramMessageIngestService._forward_source_message_by_rules(
+            db=object(),
+            account=SimpleNamespace(account_id=1),
+            source_chat=SimpleNamespace(chat_pk=2),
+            db_message=SimpleNamespace(message_id=10),
+            source_messages=[SimpleNamespace(id=42)],
+        )
+
+        assert native_calls == [([8], 'auto')]
+        assert copy_calls == [([9], 'auto', [SimpleNamespace(id=42)])]
+
+    asyncio.run(run_case())
+
+
+def test_manual_forward_passes_native_hidden_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        native_calls = []
+
+        class FakeDb:
+            async def commit(self) -> None:
+                return None
+
+            async def rollback(self) -> None:
+                return None
+
+        async def fake_get_detail(db: object, model: type, pk_name: str, pk_value: int) -> SimpleNamespace:
+            if pk_name == 'message_id':
+                return SimpleNamespace(message_id=pk_value, account_id=1)
+            return SimpleNamespace(account_id=pk_value)
+
+        async def fake_get_chats_by_pks(db: object, target_chat_pks: list[int]) -> list:
+            return [SimpleNamespace(chat_pk=2, chat_id='target', chat_title='Target')]
+
+        async def fake_forward_native_hidden_to_chats(
+            cls: type,
+            db: object,
+            account: object,
+            message: object,
+            target_chats: list,
+            forward_type: str,
+        ) -> list:
+            native_calls.append((message.message_id, [chat.chat_pk for chat in target_chats], forward_type))
+            return [SimpleNamespace(status='success')]
+
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_detail', fake_get_detail)
+        monkeypatch.setattr('module_telegram.service.telegram_service.TelegramDao.get_chats_by_pks', fake_get_chats_by_pks)
+        monkeypatch.setattr(TelegramForwardService, 'forward_native_hidden_to_chats', classmethod(fake_forward_native_hidden_to_chats))
+
+        result = await TelegramCrudService.manual_forward(
+            FakeDb(),
+            SimpleNamespace(message_id=10, target_chat_pks=[2], forward_mode='native_hidden'),
+        )
+
+        assert result.is_success is True
+        assert native_calls == [(10, [2], 'manual')]
 
     asyncio.run(run_case())
 

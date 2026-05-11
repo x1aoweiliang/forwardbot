@@ -467,7 +467,10 @@ class TelegramCrudService:
         if not account:
             raise ServiceException(message='发送账号不存在')
         try:
-            results = await TelegramForwardService.forward_to_chats(db, account, message, target_chats, 'manual')
+            if getattr(item, 'forward_mode', 'native_hidden') == 'native_hidden':
+                results = await TelegramForwardService.forward_native_hidden_to_chats(db, account, message, target_chats, 'manual')
+            else:
+                results = await TelegramForwardService.forward_to_chats(db, account, message, target_chats, 'manual')
             await db.commit()
             success_count = sum(1 for result in results if result.status == 'success')
             return CrudResponseModel(is_success=True, message=f'手动转发完成，成功{success_count}个')
@@ -528,6 +531,113 @@ class TelegramForwardService:
                 return []
             ordered_messages.append(source_by_id[source_message_id])
         return ordered_messages
+
+    @classmethod
+    def _source_message_ids(cls, message: TgMessage, medias: list[Any]) -> list[int]:
+        if medias:
+            source_ids = [
+                getattr(media, 'source_telegram_message_id', None)
+                for media in sorted(medias, key=lambda item: getattr(item, 'media_index', 0) or 0)
+            ]
+            return source_ids if all(source_id is not None for source_id in source_ids) else []
+        telegram_message_id = getattr(message, 'telegram_message_id', None)
+        return [telegram_message_id] if telegram_message_id is not None else []
+
+    @classmethod
+    async def _forward_native_hidden_to_chat(
+        cls,
+        client: Any,
+        message: TgMessage,
+        target_chat: TgChat,
+        source_message_ids: list[int],
+        forward_type: str,
+    ) -> ForwardDispatchResult:
+        try:
+            if not source_message_ids:
+                raise RuntimeError('源消息不可用')
+            sent_message = await client.forward_messages(
+                ForwardDispatcher._normalize_target_chat(target_chat.chat_id),
+                source_message_ids,
+                from_peer=ForwardDispatcher._normalize_target_chat(message.source_chat_id),
+                drop_author=True,
+                drop_media_captions=False,
+            )
+            if isinstance(sent_message, list):
+                sent_message_id = getattr(sent_message[0], 'id', None) if sent_message else None
+            else:
+                sent_message_id = getattr(sent_message, 'id', None)
+            return ForwardDispatchResult(
+                message_id=message.message_id,
+                target_chat_id=target_chat.chat_id,
+                forward_type=forward_type,
+                status='success',
+                sent_telegram_message_id=sent_message_id,
+            )
+        except Exception as exc:
+            return ForwardDispatchResult(
+                message_id=message.message_id,
+                target_chat_id=target_chat.chat_id,
+                forward_type=forward_type,
+                status='failed',
+                error_message=str(exc),
+            )
+
+    @classmethod
+    async def forward_native_hidden_to_chats(
+        cls,
+        db: AsyncSession,
+        account: TgAccount,
+        message: TgMessage,
+        target_chats: list[TgChat],
+        forward_type: str,
+    ) -> list[ForwardDispatchResult]:
+        client = await TelegramClientManager.get_authorized_client(account)
+        medias = await TelegramDao.get_media_by_message_id(db, message.message_id)
+        source_message_ids = cls._source_message_ids(message, medias)
+        results = [
+            await cls._forward_native_hidden_to_chat(client, message, target_chat, source_message_ids, forward_type)
+            for target_chat in target_chats
+        ]
+        await cls._persist_forward_results(db, account, message, target_chats, results, forward_type)
+        return results
+
+    @classmethod
+    async def _persist_forward_results(
+        cls,
+        db: AsyncSession,
+        account: TgAccount,
+        message: TgMessage,
+        target_chats: list[TgChat],
+        results: list[ForwardDispatchResult],
+        forward_type: str,
+    ) -> None:
+        chat_map = {chat.chat_id: chat for chat in target_chats}
+        for result in results:
+            chat = chat_map.get(result.target_chat_id)
+            await TelegramDao.add_forward_record(
+                db,
+                {
+                    'message_id': message.message_id,
+                    'account_id': account.account_id,
+                    'target_chat_pk': chat.chat_pk if chat else None,
+                    'target_chat_id': result.target_chat_id,
+                    'target_chat_title': chat.chat_title if chat else None,
+                    'forward_type': forward_type,
+                    'status': result.status,
+                    'sent_telegram_message_id': result.sent_telegram_message_id,
+                    'error_message': result.error_message,
+                    'create_time': datetime.now(),
+                },
+            )
+        if forward_type == 'auto':
+            await TelegramDao.update_message(
+                db,
+                {
+                    'message_id': message.message_id,
+                    'auto_forward_status': 'success' if all(result.status == 'success' for result in results) else 'partial_failed',
+                    'update_time': datetime.now(),
+                },
+            )
 
     @classmethod
     async def _download_media_fallback(
@@ -644,33 +754,7 @@ class TelegramForwardService:
                 ad_text_by_target_id,
                 forward_type,
             )
-        chat_map = {chat.chat_id: chat for chat in target_chats}
-        for result in results:
-            chat = chat_map.get(result.target_chat_id)
-            await TelegramDao.add_forward_record(
-                db,
-                {
-                    'message_id': message.message_id,
-                    'account_id': account.account_id,
-                    'target_chat_pk': chat.chat_pk if chat else None,
-                    'target_chat_id': result.target_chat_id,
-                    'target_chat_title': chat.chat_title if chat else None,
-                    'forward_type': forward_type,
-                    'status': result.status,
-                    'sent_telegram_message_id': result.sent_telegram_message_id,
-                    'error_message': result.error_message,
-                    'create_time': datetime.now(),
-                },
-            )
-        if forward_type == 'auto':
-            await TelegramDao.update_message(
-                db,
-                {
-                    'message_id': message.message_id,
-                    'auto_forward_status': 'success' if all(result.status == 'success' for result in results) else 'partial_failed',
-                    'update_time': datetime.now(),
-                },
-            )
+        await cls._persist_forward_results(db, account, message, target_chats, results, forward_type)
         return results
 
 
@@ -805,7 +889,10 @@ class TelegramMessageIngestService:
             target_pks = ListenerRulePolicy.parse_chat_pks(rule.target_chat_pks)
             targets = await TelegramDao.get_chats_by_pks(db, target_pks)
             try:
-                await TelegramForwardService.forward_to_chats(db, account, db_message, targets, 'auto', source_messages=source_messages)
+                if getattr(rule, 'forward_mode', 'copy_clean') == 'native_hidden':
+                    await TelegramForwardService.forward_native_hidden_to_chats(db, account, db_message, targets, 'auto')
+                else:
+                    await TelegramForwardService.forward_to_chats(db, account, db_message, targets, 'auto', source_messages=source_messages)
             except Exception as exc:
                 for target in targets:
                     await TelegramDao.add_forward_record(

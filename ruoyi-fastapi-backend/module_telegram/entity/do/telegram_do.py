@@ -75,6 +75,7 @@ class TgListenerRule(Base):
     source_chat_pk = Column(BigInteger, nullable=False, comment='来源频道主键')
     source_chat_pks = Column(String(1000), nullable=True, comment='来源频道主键，逗号分隔')
     target_chat_pks = Column(String(1000), nullable=False, comment='目标频道主键，逗号分隔')
+    forward_mode = Column(String(30), nullable=False, server_default='copy_clean', comment='转发方式：copy_clean清洗复制 native_hidden原生隐藏')
     rule_name = Column(String(100), nullable=False, comment='规则名称')
     status = Column(CHAR(1), nullable=False, server_default='0', comment='状态（0启用 1停用）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')

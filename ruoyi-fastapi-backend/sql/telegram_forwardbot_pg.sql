@@ -46,6 +46,7 @@ create table if not exists tg_listener_rule (
     source_chat_pk bigint not null,
     source_chat_pks varchar(1000),
     target_chat_pks varchar(1000) not null,
+    forward_mode varchar(30) not null default 'copy_clean',
     rule_name varchar(100) not null,
     status char(1) not null default '0',
     create_by varchar(64) default '',
@@ -54,6 +55,8 @@ create table if not exists tg_listener_rule (
     update_time timestamp,
     remark varchar(500)
 );
+
+alter table tg_listener_rule add column if not exists forward_mode varchar(30) not null default 'copy_clean';
 
 create table if not exists tg_sensitive_word (
     word_id bigserial primary key,

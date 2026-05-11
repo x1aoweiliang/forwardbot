@@ -36,6 +36,11 @@
             <el-option v-for="chat in targetOptions" :key="chat.chatPk" :label="chat.chatTitle" :value="chat.chatPk" />
           </el-select>
         </el-form-item>
+        <el-form-item label="转发方式">
+          <el-radio-group v-model="forwardForm.forwardMode">
+            <el-radio v-for="item in forwardModeOptions" :key="item.value" :label="item.value">{{ item.label }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
       </el-form>
       <template #footer><el-button type="primary" @click="submitForward">发送</el-button><el-button @click="forwardOpen = false">取消</el-button></template>
     </el-dialog>
@@ -50,6 +55,7 @@ const sourceOptions = ref([]);
 const targetOptions = ref([]);
 const yesNoOptions = [{ label: "是", value: "Y" }, { label: "否", value: "N" }];
 const forwardStatusOptions = [{ label: "待转发", value: "pending" }, { label: "已阻止", value: "blocked" }, { label: "成功", value: "success" }, { label: "部分失败", value: "partial_failed" }];
+const forwardModeOptions = [{ label: "原生隐藏转发", value: "native_hidden" }, { label: "清洗广告复制发送", value: "copy_clean" }];
 const data = reactive({ queryParams: { pageNum: 1, pageSize: 10 }, forwardForm: {} });
 const { queryParams, forwardForm } = toRefs(data);
 function getList() { loading.value = true; messageApi.list(queryParams.value).then((res) => { rows.value = res.rows; total.value = res.total; loading.value = false; }); }
@@ -59,11 +65,11 @@ function optionLabel(options, value) { return options.find((item) => item.value 
 function handleQuery() { queryParams.value.pageNum = 1; getList(); }
 function resetQuery() { proxy.resetForm("queryRef"); handleQuery(); }
 function handleAccountChange(accountId) { queryParams.value.sourceChatPk = undefined; getChatOptions(accountId); handleQuery(); }
-function openForward(row) { forwardForm.value = { messageId: row.messageId, messageLabel: `${row.sourceChatTitle || ""} #${row.telegramMessageId || row.messageId}`, targetChatPks: [] }; getChatOptions(row.accountId); forwardOpen.value = true; }
+function openForward(row) { forwardForm.value = { messageId: row.messageId, messageLabel: `${row.sourceChatTitle || ""} #${row.telegramMessageId || row.messageId}`, targetChatPks: [], forwardMode: "native_hidden" }; getChatOptions(row.accountId); forwardOpen.value = true; }
 function submitForward() {
   const targetChatPksValue = forwardForm.value.targetChatPks || [];
   if (!targetChatPksValue.length) { proxy.$modal.msgError("目标频道不能为空"); return; }
-  messageApi.manualForward({ messageId: forwardForm.value.messageId, targetChatPks: targetChatPksValue }).then((res) => { proxy.$modal.msgSuccess(res.msg); forwardOpen.value = false; getList(); });
+  messageApi.manualForward({ messageId: forwardForm.value.messageId, targetChatPks: targetChatPksValue, forwardMode: forwardForm.value.forwardMode || "native_hidden" }).then((res) => { proxy.$modal.msgSuccess(res.msg); forwardOpen.value = false; getList(); });
 }
 getAccountOptions();
 getChatOptions(undefined);

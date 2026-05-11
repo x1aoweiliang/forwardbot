@@ -80,6 +80,7 @@ class TgListenerRuleModel(TelegramBaseModel):
     source_chat_pk: int | None = Field(default=None, description='来源频道主键')
     source_chat_pks: str | None = Field(default=None, description='来源频道主键，逗号分隔')
     target_chat_pks: str | None = Field(default=None, description='目标频道主键，逗号分隔')
+    forward_mode: Literal['copy_clean', 'native_hidden'] | None = Field(default='copy_clean', description='转发方式')
     rule_name: str | None = Field(default=None, description='规则名称')
     status: Literal['0', '1'] | None = Field(default='0', description='状态')
     create_by: str | None = Field(default=None, description='创建者')
@@ -223,6 +224,7 @@ class TgForwardRecordPageQueryModel(TgForwardRecordModel):
 class TgManualForwardModel(TelegramBaseModel):
     message_id: int = Field(description='消息ID')
     target_chat_pks: list[int] = Field(description='目标频道主键列表')
+    forward_mode: Literal['copy_clean', 'native_hidden'] | None = Field(default='native_hidden', description='转发方式')
 
 
 class TgChatSendMessageModel(TelegramBaseModel):
