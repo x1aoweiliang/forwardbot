@@ -220,13 +220,14 @@ class TgForwardRecord(Base):
     __table_args__ = {'comment': 'Telegram发送记录表'}
 
     record_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='发送记录主键')
-    message_id = Column(BigInteger, nullable=True, comment='消息ID；主动对话框发送为空')
+    message_id = Column(BigInteger, nullable=True, index=True, comment='消息ID；主动对话框发送为空')
     account_id = Column(BigInteger, nullable=False, comment='发送账号ID')
     target_chat_pk = Column(BigInteger, nullable=True, comment='目标频道主键')
     target_chat_id = Column(String(100), nullable=False, comment='目标Telegram Chat ID')
     target_chat_title = Column(String(255), nullable=True, comment='目标标题')
     forward_type = Column(String(20), nullable=False, comment='发送类型：auto/manual/dialog')
-    status = Column(String(30), nullable=False, comment='发送状态')
+    source_message_ids = Column(Text, nullable=True, comment='本次发送的源消息ID，JSON数组')
+    status = Column(String(30), nullable=False, index=True, comment='发送状态')
     sent_telegram_message_id = Column(BigInteger, nullable=True, comment='发送后的Telegram消息ID')
     error_message = Column(Text, nullable=True, comment='错误原因')
     create_time = Column(DateTime, nullable=True, default=datetime.now, comment='创建时间')

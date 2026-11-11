@@ -14,6 +14,7 @@ from config.get_scheduler import SchedulerUtil
 from exceptions.handle import handle_exception
 from middlewares.handle import handle_middleware
 from module_admin.service.log_service import LogAggregatorService
+from module_telegram.service.archive_quark_auth import quark_login_service
 from module_telegram.service.archive_worker import TelegramArchiveWorker
 from module_telegram.service.telegram_client_service import TelegramClientManager
 from sub_applications.handle import handle_sub_applications
@@ -53,6 +54,7 @@ async def _stop_background_tasks(app: FastAPI) -> None:
     archive_worker = getattr(app.state, 'archive_worker', None)
     if archive_worker:
         await archive_worker.stop()
+    await asyncio.to_thread(quark_login_service.close)
     log_task = getattr(app.state, 'log_aggregator_task', None)
     if log_task:
         log_task.cancel()

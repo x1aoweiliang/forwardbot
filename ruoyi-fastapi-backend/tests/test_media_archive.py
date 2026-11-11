@@ -431,22 +431,15 @@ def test_preview_tickets_are_media_scoped_and_paths_cannot_escape(
             normalize_path(path)
 
 
-def test_quark_browse_uses_complete_artifact_not_five_item_preview(monkeypatch: pytest.MonkeyPatch) -> None:
-    storage = QuarkArchiveStorage(StorageSpec(id='q', name='Quark', type='quark'))
+def test_quark_browse_uses_full_cli_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = QuarkArchiveStorage(StorageSpec(id='q', name='Quark', type='quark', prefix='素材'), cookie='test')
 
-    def run(args: list[str], cwd: str) -> list[dict]:
-        assert args == ['browse', '--parent-fid', '0', '--all']
-        file = Path(cwd) / 'results.jsonl'
-        file.write_text(
-            '\n'.join(json.dumps({'fid': str(i), 'filename': f'folder-{i}', 'file_type': '0'}) for i in range(8))
-        )
-        return [
-            {'type': 'result', 'code': 0, 'data': {'file_list': []}},
-            {'type': 'artifact', 'data': {'file_path': str(file)}},
-        ]
+    def run(args: list[str]) -> dict:
+        assert args == ['list', '/素材']
+        return {'list': [{'fid': str(i), 'file_name': f'folder-{i}', 'dir': True} for i in range(80)]}
 
     monkeypatch.setattr(storage, '_run', run)
-    assert len(storage.list_dirs('')) == 8
+    assert len(storage.list_dirs('')) == 80
 
 
 def test_s3_upload_reconciles_remote_object_without_overwrite(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -574,6 +567,16 @@ def test_preview_http_requires_permission_and_supports_range(monkeypatch: pytest
             monkeypatch.setattr(LoginService, 'get_current_user', get_user)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
                 assert (await client.get('/telegram/archive/library')).status_code == 403
+                for method, url, body in (
+                    ('post', '/telegram/archive/local/cleanup', {'messageIds': [message_id]}),
+                    ('post', '/telegram/archive/quark/quark/login', {}),
+                    ('get', '/telegram/archive/quark/quark/status', None),
+                ):
+                    denied_response = await client.request(
+                        method, url, json=body, headers={'Authorization': 'Bearer reader'}
+                    )
+                    assert denied_response.status_code == 403
+
                 assert (
                     await client.get(
                         f'/telegram/archive/media/{media_id}/ticket', headers={'Authorization': 'Bearer no-permission'}
@@ -638,5 +641,198 @@ def test_archive_worker_starts_after_restart_with_stale_logging_lock(
             restore.assert_awaited_once()
             start.assert_called_once()
             await app.state.log_aggregator_task
+
+    asyncio.run(run())
+
+
+def test_local_cleanup_preserves_text_archives_and_requires_explicit_restore(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            message_id = await ingest(db, [source_message(10, grouped_id=777), source_message(11, grouped_id=777)])
+            await ready_media(db, message_id)
+            task_id = (
+                await TelegramArchiveService.submit(
+                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test'
+                )
+            )[0]
+            await db.execute(update(TgArchiveTask).values(status='completed'))
+            await db.commit()
+            partial = private_path(f'tg/1/{message_id}/10.jpg.part')
+            partial.write_bytes(b'abc')
+            db.sync_session.expire_on_commit = True
+            result = await TelegramArchiveService.cleanup_local(db, [message_id, message_id])
+            assert result == {'cleanedMessages': 1, 'freedBytes': 15, 'errors': []}
+            assert not partial.exists()
+            assert not private_path(f'tg/1/{message_id}/10.jpg').exists()
+            assert (await TelegramArchiveService.detail(db, message_id))['messageText'] == '原文'
+            assert (await db.get(TgArchiveTask, task_id)).status == 'completed'
+            archived = await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='archived'))
+            assert archived['rows'][0]['downloadState'] == 'deleted'
+            assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='ready')))['total'] == 0
+            assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='deleted')))['total'] == 1
+            # Replaying the album does not recreate or requeue its files.
+            await ingest(db, [source_message(10, grouped_id=777), source_message(11, grouped_id=777)])
+            assert set(await db.scalars(select(TgMessageMedia.download_status))) == {'deleted'}
+            await db.rollback()
+            assert await TelegramArchiveWorker().claim('download') is None
+            assert await TelegramArchiveService.retry_download(db, message_id) == 2
+            assert (await TelegramArchiveWorker().claim('download'))['message_id'] == message_id
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('state', ['queued', 'uploading', 'retry', 'downloading'])
+def test_cleanup_blocks_active_work_without_deleting_any_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
+) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            first = await ingest(db, [source_message(10)])
+            second = await ingest(db, [source_message(11)])
+            await ready_media(db, first)
+            await ready_media(db, second)
+            if state == 'downloading':
+                await db.execute(
+                    update(TgMessageMedia).where(TgMessageMedia.message_id == second).values(download_status=state)
+                )
+            else:
+                await TelegramArchiveService.submit(
+                    db, ArchiveSubmitModel(message_ids=[second], storage_id='test'), 'test'
+                )
+                await db.execute(update(TgArchiveTask).values(status=state))
+            await db.commit()
+            with pytest.raises(ServiceException, match='') as error:
+                await TelegramArchiveService.cleanup_local(db, [first, second])
+            assert '暂不能清理' in error.value.message
+            await db.rollback()
+            assert private_path(f'tg/1/{first}/10.jpg').exists()
+            assert private_path(f'tg/1/{second}/11.jpg').exists()
+            assert (
+                await db.scalar(select(TgMessageMedia.download_status).where(TgMessageMedia.message_id == first))
+                == 'ready'
+            )
+
+    asyncio.run(run())
+
+
+def test_partial_cleanup_can_resume_and_does_not_stall_other_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            message_id = await ingest(db, [source_message(10, grouped_id=777)])
+            partial = private_path(f'tg/1/{message_id}/10.jpg.part')
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b'abc')
+            original = Path.unlink
+            with monkeypatch.context() as patch:
+
+                def denied(path: Path, *args: Any, **kwargs: Any) -> None:
+                    if path == partial:
+                        raise PermissionError
+                    original(path, *args, **kwargs)
+
+                patch.setattr(Path, 'unlink', denied)
+                result = await TelegramArchiveService.cleanup_local(db, [message_id])
+            assert result['freedBytes'] == 0 and result['errors']
+            assert await db.scalar(select(TgMessageMedia.download_status)) == 'deleting'
+            with pytest.raises(ServiceException):
+                await TelegramArchiveService.retry_download(db, message_id)
+            await db.rollback()
+            # Late arrivals are distinct files, and cannot starve the global queue.
+            await ingest(db, [source_message(11, grouped_id=777)])
+            other = await ingest(db, [source_message(20)])
+            assert (await TelegramArchiveWorker().claim('download'))['message_id'] == other
+            result = await TelegramArchiveService.cleanup_local(db, [message_id])
+            assert result['freedBytes'] == 3 and not result['errors']
+            assert not partial.exists()
+            assert (await TelegramArchiveService.cleanup_local(db, [message_id]))['freedBytes'] == 0
+
+    asyncio.run(run())
+
+
+def test_cleanup_rejects_paths_from_other_messages_and_symlinks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            message_id = await ingest(db, [source_message()])
+            outside = tmp_path / 'important.jpg'
+            outside.write_bytes(b'keep')
+            for stored in ('../important.jpg', 'tg/1/999/10.jpg'):
+                await db.execute(update(TgMessageMedia).values(local_path=stored, download_status='ready'))
+                await db.commit()
+                with pytest.raises(ServiceException):
+                    await TelegramArchiveService.cleanup_local(db, [message_id])
+                await db.rollback()
+            await db.execute(update(TgMessageMedia).values(local_path=''))
+            await db.commit()
+            link = Path(ArchiveConfig.archive_media_dir) / f'tg/1/{message_id}/10.jpg'
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside)
+            with pytest.raises(ServiceException):
+                await TelegramArchiveService.cleanup_local(db, [message_id])
+            assert outside.read_bytes() == b'keep'
+
+    asyncio.run(run())
+
+
+def test_failed_archive_requires_missing_local_media_to_be_restored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            message_id = await ingest(db, [source_message()])
+            await ready_media(db, message_id)
+            task_id = (
+                await TelegramArchiveService.submit(
+                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test'
+                )
+            )[0]
+            await db.execute(update(TgArchiveTask).values(status='failed'))
+            await db.commit()
+            await TelegramArchiveService.cleanup_local(db, [message_id])
+            with pytest.raises(ServiceException) as error:
+                await TelegramArchiveService.retry_archive(db, task_id)
+            assert '重新下载' in error.value.message
+            await db.rollback()
+            await ready_media(db, message_id)
+            await TelegramArchiveService.retry_archive(db, task_id)
+            assert (await db.get(TgArchiveTask, task_id)).status == 'queued'
+
+    asyncio.run(run())
+
+
+def test_revoked_download_cannot_recreate_cleaned_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions:
+            async with sessions() as db:
+                message_id = await ingest(db, [source_message(10, text='', grouped_id=777)])
+            worker = TelegramArchiveWorker()
+            job = await worker.claim('download')
+
+            class Client:
+                async def get_messages(self, *_args: Any, **_kwargs: Any) -> Any:
+                    async with sessions() as db:
+                        db.add(TgSensitiveWord(word='spam', match_case='N'))
+                        await db.commit()
+                        await ingest(db, [source_message(9, 'spam', 777)])
+                        await TelegramArchiveService.cleanup_local(db, [message_id])
+                    return source_message(10, grouped_id=777)
+
+                def iter_download(self, *_args: Any, **_kwargs: Any) -> None:
+                    pytest.fail('revoked job must not open a download stream')
+
+            async def client(_account: Any) -> Client:
+                return Client()
+
+            monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', client)
+            with pytest.raises(asyncio.CancelledError):
+                await worker.download(job)
+            assert not private_path(f'tg/1/{message_id}/10.jpg.part').exists()
+            async with sessions() as db:
+                assert set(await db.scalars(select(TgMessageMedia.download_status))) == {'deleted'}
 
     asyncio.run(run())

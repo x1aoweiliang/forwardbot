@@ -181,3 +181,9 @@ class TelegramDao:
     @classmethod
     async def add_forward_record(cls, db: AsyncSession, data: dict[str, Any]) -> TgForwardRecord:
         return await cls.add_item(db, TgForwardRecord, data)
+
+    @classmethod
+    async def get_auto_forward_records(cls, db: AsyncSession, message_id: int) -> list[TgForwardRecord]:
+        return list((await db.scalars(select(TgForwardRecord).where(
+            TgForwardRecord.message_id == message_id, TgForwardRecord.forward_type == 'auto'
+        ))).all())

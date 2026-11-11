@@ -11,7 +11,13 @@ class ArchiveLibraryQuery(TelegramBaseModel):
     account_id: int | None = None
     source_chat_pk: int | None = None
     keyword: str | None = Field(default=None, max_length=200)
-    state: Literal['ready', 'pending', 'failed', 'archived', 'unarchived', 'blocked'] | None = None
+    state: Literal['ready', 'pending', 'failed', 'archived', 'unarchived', 'blocked', 'deleted', 'deleting'] | None = (
+        None
+    )
+
+
+class ArchiveCleanupModel(TelegramBaseModel):
+    message_ids: list[int] = Field(min_length=1, max_length=100)
 
 
 class ArchiveSubmitModel(TelegramBaseModel):

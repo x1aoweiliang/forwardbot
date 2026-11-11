@@ -33,3 +33,4 @@ sqlglot[rs]==28.10.0
 telethon==1.42.0
 user-agents==2.2.0
 boto3==1.44.0
+quarkpan-plus==1.0.6

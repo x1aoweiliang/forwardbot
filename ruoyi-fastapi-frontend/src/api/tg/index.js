@@ -75,6 +75,11 @@ export const archiveApi = {
   library(params) { return request({ url: '/telegram/archive/library', params }); },
   detail(id) { return request({ url: `/telegram/archive/message/${id}` }); },
   retryDownload(id) { return request({ url: `/telegram/archive/message/${id}/retry`, method: 'post' }); },
+  cleanup(data) { return request({ url: '/telegram/archive/local/cleanup', method: 'post', data, timeout: 180000 }); },
+  quarkStatus(id) { return request({ url: `/telegram/archive/quark/${id}/status`, timeout: 180000 }); },
+  quarkLogin(id) { return request({ url: `/telegram/archive/quark/${id}/login`, method: 'post', timeout: 180000 }); },
+  quarkPoll(id, session) { return request({ url: `/telegram/archive/quark/${id}/login/${session}`, timeout: 180000 }); },
+  quarkCancel(id, session) { return request({ url: `/telegram/archive/quark/${id}/login/${session}`, method: 'delete' }); },
   storages() { return request({ url: '/telegram/archive/storages' }); },
   folders(storageId, path) {
     return request({ url: '/telegram/archive/folders', params: { storage_id: storageId, path }, timeout: 180000 });

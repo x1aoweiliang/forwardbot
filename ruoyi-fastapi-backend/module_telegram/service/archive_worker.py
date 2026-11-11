@@ -1,10 +1,9 @@
 import asyncio
 import json
-import mimetypes
 import shutil
 import time
 import uuid
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,11 +16,12 @@ from config.database import AsyncSessionLocal
 from config.env import ArchiveConfig
 from module_telegram.dao.telegram_dao import TelegramDao
 from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveTask
-from module_telegram.entity.do.telegram_do import TgAccount, TgChat, TgMessage, TgMessageMedia
-from module_telegram.service.archive_service import file_sha256, manifest_files, private_path
+from module_telegram.entity.do.telegram_do import TgAccount, TgChat, TgForwardRecord, TgMessage, TgMessageMedia
+from module_telegram.service.archive_service import file_sha256, manifest_files, media_filename, private_path
 from module_telegram.service.archive_storage import ArchiveStorageError, child_path, get_storage
 from module_telegram.service.telegram_client_service import TelegramClientManager
 from module_telegram.service.telegram_rule_service import ListenerRulePolicy, TelegramStorageService
+from module_telegram.service.telegram_service import TelegramForwardService
 from utils.log_util import logger
 
 
@@ -49,6 +49,7 @@ class TelegramArchiveWorker:
             Path(ArchiveConfig.archive_media_dir).mkdir(parents=True, exist_ok=True)
             self.tasks = [asyncio.create_task(self._loop(kind)) for kind in ('download', 'archive')]
             self.tasks.append(asyncio.create_task(self._catchup_loop()))
+            self.tasks.append(asyncio.create_task(self._forward_loop()))
 
     async def stop(self) -> None:
         for task in self.tasks:
@@ -73,8 +74,29 @@ class TelegramArchiveWorker:
             and_(state == ('downloading' if kind == 'download' else 'uploading'), model.lease_until < now),
         )
         async with AsyncSessionLocal() as db:
-            candidate = await db.scalar(select(getattr(model, pk)).where(ready).order_by(getattr(model, pk)).limit(1))
+            candidate = (
+                await db.execute(
+                    select(getattr(model, pk), model.message_id)
+                    .where(
+                        ready,
+                        model.message_id.not_in(
+                            select(TgMessageMedia.message_id).where(TgMessageMedia.download_status == 'deleting')
+                        ),
+                    )
+                    .order_by(getattr(model, pk))
+                    .limit(1)
+                )
+            ).first()
             if candidate is None:
+                return None
+            candidate, message_id = candidate
+            await db.scalar(select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update())
+            if await db.scalar(
+                select(TgMessageMedia.media_id)
+                .where(TgMessageMedia.message_id == message_id, TgMessageMedia.download_status == 'deleting')
+                .with_for_update()
+                .limit(1)
+            ):
                 return None
             token = uuid.uuid4().hex
             result = await db.execute(
@@ -198,24 +220,38 @@ class TelegramArchiveWorker:
         media_id = getattr(getattr(source, 'photo', None) or getattr(source, 'document', None), 'id', None)
         if job.get('source_media_id') and media_id != job['source_media_id']:
             raise ArchiveStorageError('源消息的素材已被替换，无法恢复原始素材')
-        suffix = mimetypes.guess_extension(job['mime_type'] or '') or '.bin'
-        if suffix == '.jpe':
-            suffix = '.jpg'
-        filename = f'{job["source_telegram_message_id"]}{suffix}'
+        filename = media_filename(job['source_telegram_message_id'], job['mime_type'])
         storage = TelegramStorageService(ArchiveConfig.archive_media_dir)
         path = storage.build_media_path(account_data.account_id, job['message_id'], filename)
-        path.absolute_path.parent.mkdir(parents=True, exist_ok=True)
         partial = path.absolute_path.with_name(path.absolute_path.name + '.part')
-        written = partial.stat().st_size if partial.exists() else 0
         expected = getattr(getattr(source, 'file', None), 'size', None) or job['file_size']
-        if expected is not None and written > expected:
-            partial.unlink()
-            written = 0
-        free = shutil.disk_usage(storage.base_dir).free
-        if free < ArchiveConfig.archive_min_free_bytes + max(0, (expected or 0) - written):
-            raise DiskSpaceError
-        last_progress = time.monotonic()
-        async with aiofiles.open(partial, 'ab') as output:
+        async with AsyncExitStack() as stack:
+            async with AsyncSessionLocal() as db:
+                await db.scalar(
+                    select(TgMessage.message_id).where(TgMessage.message_id == job['message_id']).with_for_update()
+                )
+                active = await db.scalar(
+                    select(TgMessageMedia.media_id)
+                    .where(
+                        TgMessageMedia.media_id == job['media_id'],
+                        TgMessageMedia.lease_token == job['lease_token'],
+                        TgMessageMedia.download_status == 'downloading',
+                    )
+                    .with_for_update()
+                )
+                if active is None:
+                    raise asyncio.CancelledError
+                path.absolute_path.parent.mkdir(parents=True, exist_ok=True)
+                written = partial.stat().st_size if partial.exists() else 0
+                if expected is not None and written > expected:
+                    partial.unlink()
+                    written = 0
+                free = shutil.disk_usage(storage.base_dir).free
+                if free < ArchiveConfig.archive_min_free_bytes + max(0, (expected or 0) - written):
+                    raise DiskSpaceError
+                output = await stack.enter_async_context(aiofiles.open(partial, 'ab'))
+                await db.commit()
+            last_progress = time.monotonic()
             stream = client.iter_download(source.media, offset=written)
             try:
                 async for chunk in stream:
@@ -233,20 +269,40 @@ class TelegramArchiveWorker:
         if expected is not None and written != expected:
             raise ArchiveStorageError('文件未完整下载，等待重试')
         checksum = await asyncio.to_thread(file_sha256, partial)
-        partial.replace(path.absolute_path)
-        await self._update(
-            'download',
-            job,
-            download_status='ready',
-            local_path=path.relative_path,
-            downloaded_bytes=written,
-            file_size=written,
-            sha256=checksum,
-            next_retry_at=None,
-            lease_token=None,
-            lease_until=None,
-            last_error=None,
-        )
+        async with AsyncSessionLocal() as db:
+            # Cleanup and late sensitive captions share this lock. A revoked
+            # downloader must not recreate files after cleanup has finished.
+            await db.scalar(
+                select(TgMessage.message_id).where(TgMessage.message_id == job['message_id']).with_for_update()
+            )
+            active = await db.scalar(
+                select(TgMessageMedia.media_id)
+                .where(
+                    TgMessageMedia.media_id == job['media_id'],
+                    TgMessageMedia.lease_token == job['lease_token'],
+                    TgMessageMedia.download_status == 'downloading',
+                )
+                .with_for_update()
+            )
+            if active is None:
+                raise asyncio.CancelledError
+            partial.replace(path.absolute_path)
+            await db.execute(
+                update(TgMessageMedia)
+                .where(TgMessageMedia.media_id == active)
+                .values(
+                    download_status='ready',
+                    local_path=path.relative_path,
+                    downloaded_bytes=written,
+                    file_size=written,
+                    sha256=checksum,
+                    next_retry_at=None,
+                    lease_token=None,
+                    lease_until=None,
+                    last_error=None,
+                )
+            )
+            await db.commit()
 
     async def archive(self, job: dict[str, Any]) -> None:
         async with AsyncSessionLocal() as db:
@@ -337,6 +393,40 @@ class TelegramArchiveWorker:
                 logger.warning('采集补偿扫描暂时失败: error_type={}', type(exc).__name__)
             await asyncio.sleep(60)
 
+    async def _forward_loop(self) -> None:
+        while True:
+            try:
+                await self.forward_waiting()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('转发补偿扫描暂时失败: error_type={}', type(exc).__name__)
+            await asyncio.sleep(ArchiveConfig.archive_poll_seconds)
+
+    async def forward_waiting(self) -> None:
+        async with AsyncSessionLocal() as db:
+            pending = (await db.execute(
+                select(TgForwardRecord.record_id, TgForwardRecord.message_id, TgForwardRecord.account_id)
+                .where(TgForwardRecord.status == 'waiting_download')
+                .order_by(TgForwardRecord.record_id)
+            )).all()
+        for record_id, message_id, account_id in pending:
+            if not TelegramClientManager._handlers.get(account_id):
+                continue
+            try:
+                async with AsyncSessionLocal() as db:
+                    # Same lock order as ingest/cleanup. Keep files stable while sending,
+                    # and recheck status after locking to prevent concurrent replay.
+                    message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
+                    record = await db.scalar(select(TgForwardRecord).where(TgForwardRecord.record_id == record_id).with_for_update())
+                    if record and record.status == 'waiting_download':
+                        await TelegramForwardService.resume_waiting_forward(db, record, message)
+                        await db.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('转发补偿暂时失败: record_id={}, error_type={}', record_id, type(exc).__name__)
+
     async def catch_up(self) -> None:
         async with AsyncSessionLocal() as db:
             accounts = [
@@ -348,58 +438,65 @@ class TelegramArchiveWorker:
             if not TelegramClientManager._handlers.get(account.account_id):
                 # Respect the existing account-level stop-listening action.
                 continue
-            async with AsyncSessionLocal() as db:
-                rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
-                source_pks = {
-                    pk
-                    for rule in rules
-                    if rule.download_enabled == 'Y'
-                    for pk in ListenerRulePolicy.source_chat_pks(rule)
-                }
-                chats = [
-                    SimpleNamespace(**row_values(chat))
-                    for chat in await TelegramDao.get_chats_by_pks(db, list(source_pks))
-                    if chat.status == '0' and chat.can_listen == 'Y'
-                ]
-            client = await TelegramClientManager.get_authorized_client(account)
-            for chat in chats:
-                entity = TelegramClientManager._normalize_chat_ref(chat.chat_id)
-                if chat.collection_cursor is None:
-                    latest = await client.get_messages(entity, limit=1)
-                    cursor = latest[0].id if latest else 0
-                else:
-                    messages = [
-                        message
-                        async for message in client.iter_messages(
-                            entity, min_id=chat.collection_cursor, reverse=True, limit=CATCHUP_PAGE_SIZE + 1
-                        )
-                    ]
-                    # Do not archive an album still arriving, or split one at a page boundary.
-                    messages = [
-                        message
-                        for message in messages
-                        if not getattr(message, 'date', None)
-                        or message.date.timestamp() <= time.time() - ALBUM_SETTLE_SECONDS
-                    ]
-                    if len(messages) > CATCHUP_PAGE_SIZE:
-                        overflow_group = getattr(messages[-1], 'grouped_id', None)
-                        messages = messages[:-1]
-                        if overflow_group:
-                            messages = [
-                                message
-                                for message in messages
-                                if getattr(message, 'grouped_id', None) != overflow_group
-                            ]
-                    groups: dict[tuple[str, int], list[Any]] = {}
-                    for message in messages:
-                        grouped_id = getattr(message, 'grouped_id', None)
-                        key = ('album', grouped_id) if grouped_id else ('message', message.id)
-                        groups.setdefault(key, []).append(message)
-                    for group in groups.values():
-                        await TelegramClientManager.persist_messages(account, chat, group)
-                    cursor = max((message.id for message in messages), default=chat.collection_cursor)
+            try:
                 async with AsyncSessionLocal() as db:
-                    await db.execute(
-                        update(TgChat).where(TgChat.chat_pk == chat.chat_pk).values(collection_cursor=cursor)
+                    rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
+                    source_pks = {
+                        pk
+                        for rule in rules
+                        if rule.download_enabled == 'Y'
+                        for pk in ListenerRulePolicy.source_chat_pks(rule)
+                    }
+                    chats = [
+                        SimpleNamespace(**row_values(chat))
+                        for chat in await TelegramDao.get_chats_by_pks(db, list(source_pks))
+                        if chat.status == '0' and chat.can_listen == 'Y'
+                    ]
+                client = await TelegramClientManager.get_authorized_client(account)
+            except Exception as exc:
+                logger.warning('采集账号补偿暂时失败: account_id={}, error_type={}', account.account_id, type(exc).__name__)
+                continue
+            for chat in chats:
+                try:
+                    await self._catch_up_chat(account, chat, client)
+                except Exception as exc:  # noqa: PERF203 - isolate failures by source, not by scan
+                    logger.warning(
+                        '采集群补偿暂时失败: account_id={}, chat_pk={}, error_type={}',
+                        account.account_id, chat.chat_pk, type(exc).__name__,
                     )
-                    await db.commit()
+
+    async def _catch_up_chat(self, account: Any, chat: Any, client: Any) -> None:
+        entity = TelegramClientManager._normalize_chat_ref(chat.chat_id)
+        if chat.collection_cursor is None:
+            latest = await client.get_messages(entity, limit=1)
+            cursor = latest[0].id if latest else 0
+        else:
+            messages = [
+                message
+                async for message in client.iter_messages(
+                    entity, min_id=chat.collection_cursor, reverse=True, limit=CATCHUP_PAGE_SIZE + 1
+                )
+            ]
+            # Do not archive an album still arriving, or split one at a page boundary.
+            messages = [
+                message
+                for message in messages
+                if not getattr(message, 'date', None)
+                or message.date.timestamp() <= time.time() - ALBUM_SETTLE_SECONDS
+            ]
+            if len(messages) > CATCHUP_PAGE_SIZE:
+                overflow_group = getattr(messages[-1], 'grouped_id', None)
+                messages = messages[:-1]
+                if overflow_group:
+                    messages = [message for message in messages if getattr(message, 'grouped_id', None) != overflow_group]
+            groups: dict[tuple[str, int], list[Any]] = {}
+            for message in messages:
+                grouped_id = getattr(message, 'grouped_id', None)
+                key = ('album', grouped_id) if grouped_id else ('message', message.id)
+                groups.setdefault(key, []).append(message)
+            for group in groups.values():
+                await TelegramClientManager.persist_messages(account, chat, group)
+            cursor = max((message.id for message in messages), default=chat.collection_cursor)
+        async with AsyncSessionLocal() as db:
+            await db.execute(update(TgChat).where(TgChat.chat_pk == chat.chat_pk).values(collection_cursor=cursor))
+            await db.commit()

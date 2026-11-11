@@ -1,4 +1,4 @@
-本分支提供独立的 Telegram 素材采集与云端归档应用，部署说明见 [独立采集部署](deploy/archive/README.md)。
+本分支在原转发功能上增加素材下载与手动云端归档，支持直接源码运行，通过配置开启或关闭后台采集任务，说明见 [源码运行与归档配置](deploy/archive/README.md)。
 
 <h1 align="center">
     <img alt="logo" src="https://oscimg.oschina.net/oscnet/up-d3d0a9303e11d522a06cd263f3079027715.png">

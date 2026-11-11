@@ -1,5 +1,6 @@
 import hashlib
 import json
+import mimetypes
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +35,27 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def media_filename(source_message_id: int, mime_type: str | None) -> str:
+    suffix = mimetypes.guess_extension(mime_type or '') or '.bin'
+    return f'{source_message_id}{".jpg" if suffix == ".jpe" else suffix}'
+
+
+def cleanup_paths(account_id: int, message_id: int, media: TgMessageMedia) -> list[Path]:
+    # Delete exact files only: late album arrivals can create other files here.
+    root = Path(ArchiveConfig.archive_media_dir).resolve()
+    directory = root / f'tg/{account_id}/{message_id}'
+    path = directory / media_filename(media.source_telegram_message_id, media.mime_type)
+    paths = {path, path.with_name(path.name + '.part')}
+    if media.local_path:
+        stored = root / media.local_path
+        if stored.parent != directory:
+            raise ServiceException(message='素材文件不属于该消息，已停止清理')
+        paths.update([stored, stored.with_name(stored.name + '.part')])
+    if any(path.resolve() != path for path in paths):
+        raise ServiceException(message='素材路径含符号链接，已停止清理')
+    return sorted(paths)
+
+
 def manifest_files(manifest: dict[str, Any]) -> dict[str, bytes]:
     return {
         'message.txt': manifest['text'].encode('utf-8'),
@@ -66,18 +88,29 @@ class TelegramArchiveService:
         failed = exists().where(
             TgMessageMedia.message_id == TgMessage.message_id, TgMessageMedia.download_status == 'failed'
         )
+        unavailable = exists().where(
+            TgMessageMedia.message_id == TgMessage.message_id,
+            TgMessageMedia.download_status.not_in(['ready', 'skipped']),
+        )
         if query.state == 'archived':
             filters.append(cls._archived())
         elif query.state == 'unarchived':
             filters.append(~cls._archived())
         elif query.state == 'ready':
-            filters.extend([~pending, ~failed, TgMessage.is_sensitive == 'N'])
+            filters.extend([~unavailable, TgMessage.is_sensitive == 'N'])
         elif query.state == 'pending':
             filters.append(pending)
         elif query.state == 'failed':
             filters.append(failed)
         elif query.state == 'blocked':
             filters.append(TgMessage.is_sensitive == 'Y')
+        elif query.state in {'deleted', 'deleting'}:
+            filters.append(
+                exists().where(
+                    TgMessageMedia.message_id == TgMessage.message_id,
+                    TgMessageMedia.download_status == query.state,
+                )
+            )
         total = await db.scalar(select(func.count()).select_from(TgMessage).where(*filters))
         messages = (
             await db.execute(
@@ -104,6 +137,10 @@ class TelegramArchiveService:
             state = (
                 'blocked'
                 if message.is_sensitive == 'Y'
+                else 'deleting'
+                if 'deleting' in states
+                else 'deleted'
+                if 'deleted' in states
                 else 'failed'
                 if 'failed' in states
                 else 'pending'
@@ -192,17 +229,99 @@ class TelegramArchiveService:
 
     @staticmethod
     async def retry_download(db: AsyncSession, message_id: int) -> int:
-        message = await db.get(TgMessage, message_id)
+        message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
         if not message or message.collected != 'Y' or message.is_sensitive == 'Y':
             raise ServiceException(message='该消息不可重试下载')
+        if await db.scalar(
+            select(TgMessageMedia.media_id)
+            .where(TgMessageMedia.message_id == message_id, TgMessageMedia.download_status == 'deleting')
+            .with_for_update()
+            .limit(1)
+        ):
+            raise ServiceException(message='请先完成本地清理，再重新下载')
         result = await db.execute(
             update(TgMessageMedia)
-            .where(TgMessageMedia.message_id == message_id, TgMessageMedia.download_status.in_(['failed', 'retry']))
+            .where(
+                TgMessageMedia.message_id == message_id,
+                TgMessageMedia.download_status.in_(['failed', 'retry', 'deleted']),
+            )
             .values(download_status='queued', attempts=0, next_retry_at=None, last_error=None)
         )
         count = result.rowcount
         await db.commit()
         return count
+
+    @staticmethod
+    async def cleanup_local(db: AsyncSession, message_ids: list[int]) -> dict[str, Any]:
+        ids = sorted(set(message_ids))
+        selected = []
+        for message_id in ids:
+            message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
+            if not message or message.collected != 'Y':
+                raise ServiceException(message=f'采集记录 {message_id} 不存在')
+            medias = (
+                await db.scalars(
+                    select(TgMessageMedia)
+                    .where(TgMessageMedia.message_id == message_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+            active_task = await db.scalar(
+                select(TgArchiveTask.task_id)
+                .where(
+                    TgArchiveTask.message_id == message_id,
+                    TgArchiveTask.status.in_(['queued', 'uploading', 'retry']),
+                )
+                .with_for_update()
+                .limit(1)
+            )
+            if active_task or any(media.download_status == 'downloading' for media in medias):
+                raise ServiceException(message=f'消息 {message_id} 正在下载或等待归档完成，暂不能清理')
+            for media in medias:
+                if media.storage_kind != 'archive' or media.download_status in {'skipped', 'disabled', 'deleted'}:
+                    continue
+                paths = cleanup_paths(message.account_id, message_id, media)
+                selected.append((message_id, media.media_id, paths))
+                media.download_status = 'deleting'
+                media.lease_token = media.lease_until = media.next_retry_at = None
+                media.last_error = None
+        # Persist intent before touching disk. A crash leaves retryable cleanup,
+        # never a ready record pointing at a file that was already removed.
+        await db.commit()
+        freed, cleaned, errors = 0, set(), []
+        for message_id in ids:
+            await db.scalar(select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update())
+        for message_id, media_id, paths in selected:
+            media = await db.scalar(
+                select(TgMessageMedia)
+                .where(TgMessageMedia.media_id == media_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if media.download_status != 'deleting':
+                continue
+            try:
+                for path in paths:
+                    if path.resolve() != path:
+                        raise OSError('symbolic link')
+                    try:
+                        size = path.stat().st_size
+                        path.unlink()
+                        freed += size
+                    except FileNotFoundError:
+                        pass
+            except OSError:
+                media.last_error = '本地文件清理失败，请检查目录权限后再次清理'
+                errors.append({'messageId': message_id, 'mediaId': media_id, 'message': media.last_error})
+                continue
+            media.download_status, media.local_path = 'deleted', ''
+            media.downloaded_bytes, media.attempts = 0, 0
+            media.sha256 = media.last_error = None
+            cleaned.add(message_id)
+        result = {'cleanedMessages': len(cleaned), 'freedBytes': freed, 'errors': errors}
+        await db.commit()
+        return result
 
     @classmethod
     async def submit(cls, db: AsyncSession, request: ArchiveSubmitModel, username: str) -> list[int]:
@@ -319,6 +438,21 @@ class TelegramArchiveService:
 
     @staticmethod
     async def retry_archive(db: AsyncSession, task_id: int) -> None:
+        message_id = await db.scalar(select(TgArchiveTask.message_id).where(TgArchiveTask.task_id == task_id))
+        await db.scalar(select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update())
+        medias = (
+            await db.scalars(
+                select(TgMessageMedia)
+                .join(TgArchiveItem, TgArchiveItem.media_id == TgMessageMedia.media_id)
+                .where(TgArchiveItem.task_id == task_id, TgArchiveItem.status != 'completed')
+                .with_for_update()
+            )
+        ).all()
+        if any(
+            media.download_status != 'ready' or not media.local_path or not private_path(media.local_path).is_file()
+            for media in medias
+        ):
+            raise ServiceException(message='本地素材尚未就绪，请先重新下载再重试归档')
         result = await db.execute(
             update(TgArchiveTask)
             .where(TgArchiveTask.task_id == task_id, TgArchiveTask.status.in_(['failed', 'retry']))

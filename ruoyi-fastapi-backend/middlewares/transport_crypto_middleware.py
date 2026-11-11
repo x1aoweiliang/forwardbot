@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qs, urlencode
 
@@ -57,6 +58,12 @@ class TransportCryptoMiddleware:
         path = self._normalize_path(str(scope.get('path', '')))
         if (
             self._is_excluded_path(path)
+            # Native image/video requests cannot send encrypted envelopes. This
+            # exact read-only route verifies a short-lived, media-scoped ticket.
+            or (
+                scope.get('method') in {'GET', 'HEAD'}
+                and re.fullmatch(r'/telegram/archive/media/[0-9]+/content', path) is not None
+            )
             or TransportCryptoConfig.transport_crypto_mode == 'off'
             or not self._is_enabled_path(path)
         ):

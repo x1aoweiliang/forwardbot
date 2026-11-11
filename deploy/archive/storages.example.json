@@ -3,8 +3,8 @@
     "id": "quark",
     "name": "夸克素材库",
     "type": "quark",
-    "cli_path": "/opt/quark/scripts/quark-drive.cjs",
-    "root_fid": "0"
+    "cli_path": "/usr/local/bin/kuake",
+    "prefix": ""
   },
   {
     "id": "s3",

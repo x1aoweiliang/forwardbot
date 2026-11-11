@@ -50,7 +50,6 @@ services:
       - app-state:/app/vf_admin
       - logs:/app/logs
       - quark-cli:/opt/quark
-      - quark-auth:/root
       - ./deploy/archive/storages.json:/run/archive/storages.json:ro
     depends_on:
       postgres:
@@ -99,4 +98,3 @@ volumes:
   app-state:
   logs:
   quark-cli:
-  quark-auth:

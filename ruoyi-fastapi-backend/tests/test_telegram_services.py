@@ -39,6 +39,7 @@ def fresh_message_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr('module_telegram.dao.telegram_dao.TelegramDao.find_source_message', no_previous)
     monkeypatch.setattr('module_telegram.dao.telegram_dao.TelegramDao.get_enabled_rules_for_account', no_rules)
+    monkeypatch.setattr('module_telegram.dao.telegram_dao.TelegramDao.get_auto_forward_records', no_rules)
 
 
 def test_sensitive_word_matcher_returns_first_enabled_hit() -> None:
@@ -1151,7 +1152,7 @@ def test_native_hidden_forward_does_not_send_partial_album_without_source_ids(mo
     asyncio.run(run_case())
 
 
-def test_tg_media_source_reference_migration_sets_local_path_default() -> None:
+def test_tg_media_source_reference_migration_sets_local_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
     migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260506_01_add_tg_media_source_reference.py'
     spec = importlib.util.spec_from_file_location('tg_media_source_reference_migration', migration_path)
     assert spec and spec.loader
@@ -1161,8 +1162,8 @@ def test_tg_media_source_reference_migration_sets_local_path_default() -> None:
 
     migration._has_table = lambda table_name: table_name == 'tg_message_media'
     migration._has_column = lambda table_name, column_name: column_name in {'local_path'}
-    migration.op.add_column = lambda *args, **kwargs: None
-    migration.op.alter_column = lambda *args, **kwargs: alter_calls.append((args, kwargs))
+    monkeypatch.setattr(migration.op, 'add_column', lambda *args, **kwargs: None)
+    monkeypatch.setattr(migration.op, 'alter_column', lambda *args, **kwargs: alter_calls.append((args, kwargs)))
 
     migration.upgrade()
 
@@ -1172,7 +1173,7 @@ def test_tg_media_source_reference_migration_sets_local_path_default() -> None:
     )
 
 
-def test_listener_rule_source_chat_pks_migration_uses_cross_database_cast() -> None:
+def test_listener_rule_source_chat_pks_migration_uses_cross_database_cast(monkeypatch: pytest.MonkeyPatch) -> None:
     migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260507_01_add_tg_listener_rule_source_chat_pks.py'
     spec = importlib.util.spec_from_file_location('tg_listener_rule_source_pks_migration', migration_path)
     assert spec and spec.loader
@@ -1185,8 +1186,8 @@ def test_listener_rule_source_chat_pks_migration_uses_cross_database_cast() -> N
     def capture_execute(statement: object) -> None:
         execute_calls.append(statement)
 
-    migration.op.add_column = lambda *args, **kwargs: None
-    migration.op.execute = capture_execute
+    monkeypatch.setattr(migration.op, 'add_column', lambda *args, **kwargs: None)
+    monkeypatch.setattr(migration.op, 'execute', capture_execute)
 
     migration.upgrade()
 
@@ -1195,7 +1196,7 @@ def test_listener_rule_source_chat_pks_migration_uses_cross_database_cast() -> N
     assert not any(isinstance(statement, str) for statement in execute_calls)
 
 
-def test_listener_rule_forward_mode_migration_adds_default_column() -> None:
+def test_listener_rule_forward_mode_migration_adds_default_column(monkeypatch: pytest.MonkeyPatch) -> None:
     migration_path = Path(__file__).resolve().parents[1] / 'alembic/versions/20260511_01_add_tg_listener_rule_forward_mode.py'
     spec = importlib.util.spec_from_file_location('tg_listener_rule_forward_mode_migration', migration_path)
     assert spec and spec.loader
@@ -1205,7 +1206,7 @@ def test_listener_rule_forward_mode_migration_adds_default_column() -> None:
 
     migration._has_table = lambda table_name: table_name == 'tg_listener_rule'
     migration._has_column = lambda table_name, column_name: False
-    migration.op.add_column = lambda *args, **kwargs: add_calls.append((args, kwargs))
+    monkeypatch.setattr(migration.op, 'add_column', lambda *args, **kwargs: add_calls.append((args, kwargs)))
 
     migration.upgrade()
 

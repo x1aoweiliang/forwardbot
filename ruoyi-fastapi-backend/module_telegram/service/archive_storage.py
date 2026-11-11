@@ -1,7 +1,10 @@
 """Cloud archive adapters. Configuration is local; credentials never enter API responses."""
 
+import base64
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -11,9 +14,10 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, ValidationError
 
-from config.env import ArchiveConfig
+from config.env import ArchiveConfig, JwtConfig
 
 
 class ArchiveStorageError(Exception):
@@ -57,8 +61,7 @@ class StorageSpec(BaseModel):
     secret_key_env: str = ''
     session_token_env: str = ''
     addressing_style: Literal['auto', 'path', 'virtual'] = 'auto'
-    cli_path: str = '/opt/quark/scripts/quark-drive.cjs'
-    root_fid: str = '0'
+    cli_path: str = 'kuake'
 
 
 def load_storages() -> list[StorageSpec]:
@@ -66,7 +69,16 @@ def load_storages() -> list[StorageSpec]:
     if not path.is_file():
         return []
     try:
-        specs = [StorageSpec.model_validate(item) for item in json.loads(path.read_text(encoding='utf-8'))]
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+            raise ValueError('expected a list of storage objects')
+        if any(
+            item.get('type') == 'quark'
+            and (item.get('root_fid', '0') != '0' or str(item.get('cli_path', '')).endswith('.cjs'))
+            for item in raw
+        ):
+            raise ArchiveStorageError('请将夸克 cli_path 改为 kuake 可执行文件，并用 prefix 路径替代 root_fid')
+        specs = [StorageSpec.model_validate(item) for item in raw]
         if len({item.id for item in specs}) != len(specs):
             raise ValueError('duplicate storage id')
         for item in specs:
@@ -164,101 +176,145 @@ class S3ArchiveStorage:
         return key
 
 
-class QuarkArchiveStorage:
-    """Official CLI NDJSON protocol; never invoke a shell or auto-login in a background task."""
+def quark_credentials_path(storage_id: str) -> Path:
+    if not storage_id or any(
+        char not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for char in storage_id
+    ):
+        raise ArchiveStorageError('存储标识不合法')
+    return Path(ArchiveConfig.archive_media_dir).resolve() / '.quark-auth' / f'{storage_id}.json'
 
-    def __init__(self, spec: StorageSpec) -> None:
-        self.spec = spec
 
-    def _run(self, args: list[str], cwd: str) -> list[dict[str, Any]]:
-        if not Path(self.spec.cli_path).is_file():
-            raise ArchiveStorageError('夸克 CLI 尚未安装，请按部署文档配置并授权')
+def _credential_cipher() -> Fernet:
+    key = hashlib.sha256(('quark-archive:' + JwtConfig.jwt_secret_key).encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def load_quark_credentials(storage_id: str) -> dict[str, str]:
+    path = quark_credentials_path(storage_id)
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(_credential_cipher().decrypt(path.read_bytes()))
+    except (OSError, ValueError, InvalidToken) as exc:
+        raise ArchiveStorageError('夸克登录凭据无法读取，请检查文件权限及 JWT 密钥是否变更') from exc
+
+
+def save_quark_credentials(storage_id: str, credentials: dict[str, str]) -> None:
+    path = quark_credentials_path(storage_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
         try:
-            output = subprocess.run(
-                ['node', self.spec.cli_path, *args],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=14400 if args[0] == 'upload' else 120,
-                check=False,
-            )
+            os.chmod(temporary, 0o600)
+            output.write(_credential_cipher().encrypt(json.dumps(credentials).encode()))
+            output.flush()
+            os.fsync(output.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+class QuarkArchiveStorage:
+    """zhangjingwei/kuake_cli JSON protocol, with per-storage browser QR credentials."""
+
+    def __init__(self, spec: StorageSpec, cookie: str | None = None) -> None:
+        self.spec = spec
+        # Snapshot credentials for this operation; re-login cannot switch its account.
+        self.cookie = cookie if cookie is not None else load_quark_credentials(spec.id).get('cookie', '')
+
+    def _run(self, args: list[str]) -> dict[str, Any]:
+        executable = shutil.which(self.spec.cli_path)
+        if not executable:
+            raise ArchiveStorageError('kuake_cli 不可执行，请将 cli_path 配置为 kuake 的绝对路径')
+        if not self.cookie:
+            raise ArchiveStorageError('请先在素材库的「夸克账号」中扫码登录')
+        env = dict(os.environ)
+        env['KUAKE_COOKIE'] = self.cookie
+        try:
+            # A fresh cwd prevents kuake from loading an unrelated project's .env.
+            with tempfile.TemporaryDirectory(prefix='quark-cli-') as cwd:
+                output = subprocess.run(
+                    [str(Path(executable).resolve()), *args],
+                    cwd=cwd,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=14400 if args[0] == 'upload' else 120,
+                    check=False,
+                )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ArchiveStorageError('夸克命令启动失败或超时，请检查 CLI 和网络') from exc
         try:
-            events = [json.loads(line) for line in output.stdout.splitlines() if line.strip()]
+            result = json.loads(output.stdout)
         except ValueError as exc:
-            raise ArchiveStorageError('夸克 CLI 返回格式不兼容') from exc
-        results = [event for event in events if event.get('type') == 'result']
-        if not results or output.returncode or results[-1].get('code') != 0:
-            message = str(results[-1].get('msg', '夸克操作失败'))[:400] if results else '夸克未返回操作结果'
-            raise ArchiveStorageError(message)
-        return events
+            raise ArchiveStorageError('kuake_cli 返回格式不兼容，请检查安装版本') from exc
+        if not isinstance(result, dict) or output.returncode or result.get('success') is not True:
+            # The CLI may include a Cookie or signed URL in its raw error output.
+            raise ArchiveStorageError('夸克操作失败，请检查登录状态、目录和网盘空间后重试')
+        data = result.get('data')
+        if not isinstance(data, dict):
+            raise ArchiveStorageError('kuake_cli 未返回有效的数据')
+        return data
 
-    def _browse(self, fid: str) -> list[dict[str, Any]]:
-        with tempfile.TemporaryDirectory(prefix='quark-browse-') as directory:
-            events = self._run(['browse', '--parent-fid', fid, '--all'], directory)
-            artifact = next((event for event in events if event.get('type') == 'artifact'), None)
-            if not artifact or not artifact.get('data', {}).get('file_path'):
-                raise ArchiveStorageError('夸克目录查询未返回完整清单')
-            path = Path(artifact['data']['file_path']).resolve()
-            if not path.is_relative_to(Path(directory).resolve()):
-                raise ArchiveStorageError('夸克目录清单路径不合法')
-            return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    def account(self) -> dict[str, str]:
+        data = self._run(['user'])
+        uid = data.get('uid')
+        if not uid:
+            raise ArchiveStorageError('夸克未返回账号 ID，请检查 kuake_cli 版本及登录状态')
+        return {'uid': str(uid), 'nickname': str(data.get('nickname') or '夸克账号')}
 
-    @staticmethod
-    def _is_dir(item: dict[str, Any]) -> bool:
-        return item.get('file_type') == '0' or item.get('category') == 0
+    def _remote_path(self, path: str) -> str:
+        return '/' + '/'.join(filter(None, [normalize_path(self.spec.prefix), normalize_path(path)]))
 
-    def _resolve(self, path: str, create: bool = False) -> str:
-        fid = self.spec.root_fid
-        for name in PurePosixPath(normalize_path(path)).parts:
-            matches = [item for item in self._browse(fid) if item.get('filename') == name and self._is_dir(item)]
-            if len(matches) > 1:
-                raise ArchiveStorageError('存在多个同名目录，请先在夸克中整理目录名称')
-            if matches:
-                fid = str(matches[0]['fid'])
-            elif create:
-                with tempfile.TemporaryDirectory(prefix='quark-mkdir-') as directory:
-                    events = self._run(['create-folder', '--dir-path', name, '--parent-fid', fid], directory)
-                result = next(event for event in reversed(events) if event.get('type') == 'result')
-                fid = result.get('data', {}).get('fid')
-                if not fid:
-                    raise ArchiveStorageError('夸克创建目录未返回目录 ID')
-            else:
-                raise ArchiveStorageError('目标目录不存在，请刷新目录或新建目录')
-        return fid
+    def _list(self, remote_path: str) -> list[dict[str, Any]]:
+        files = self._run(['list', remote_path]).get('list')
+        if not isinstance(files, list) or any(not isinstance(file, dict) for file in files):
+            raise ArchiveStorageError('夸克目录查询未返回完整清单')
+        return files
 
     def list_dirs(self, path: str) -> list[dict[str, str]]:
         path = normalize_path(path)
         return sorted(
             [
-                {'name': item['filename'], 'path': child_path(path, item['filename'])}
-                for item in self._browse(self._resolve(path))
-                if self._is_dir(item)
+                {'name': item['file_name'], 'path': child_path(path, item['file_name'])}
+                for item in self._list(self._remote_path(path))
+                if item.get('dir') is True
             ],
             key=lambda item: item['name'],
         )
 
     def ensure_dir(self, path: str) -> str:
-        self._resolve(path, create=True)
+        remote = ''
+        for name in PurePosixPath(self._remote_path(path)).parts[1:]:
+            matches = [item for item in self._list(remote or '/') if item.get('file_name') == name]
+            if len(matches) > 1 or (matches and matches[0].get('dir') is not True):
+                raise ArchiveStorageError('夸克存在同名目录或文件冲突，请选择其他目录')
+            if not matches:
+                self._run(['create', name, remote or '/'])
+            remote += '/' + name
         return normalize_path(path)
 
     def upload(self, source: Path, directory: str, filename: str, sha256: str) -> str:
-        fid = self._resolve(directory)
-        files = [item for item in self._browse(fid) if item.get('filename') == filename and not self._is_dir(item)]
+        destination = self._remote_path(child_path(directory, filename))
+        remote_dir = self._remote_path(directory)
+        files = [item for item in self._list(remote_dir) if item.get('file_name') == filename]
         if files:
-            if len(files) == 1 and files[0].get('size') == source.stat().st_size:
+            if (
+                len(files) == 1
+                and files[0].get('dir') is False
+                and files[0].get('size') == source.stat().st_size
+                and files[0].get('fid')
+            ):
                 return str(files[0]['fid'])
             raise ArchiveStorageError('夸克存在同名文件冲突，请选择其他目录')
-        if source.name != filename:
-            raise ArchiveStorageError('归档文件名称不一致')
-        with tempfile.TemporaryDirectory(prefix='quark-upload-') as workdir:
-            events = self._run(['upload', '--file', str(source.resolve()), '--parent-fid', fid], workdir)
-        result = next(event for event in reversed(events) if event.get('type') == 'result')
-        data = result.get('data', {})
-        if data.get('failedCount', 0) or data.get('successCount') != 1:
-            raise ArchiveStorageError('夸克未确认文件上传成功')
-        uploaded = [item for item in self._browse(fid) if item.get('filename') == filename and not self._is_dir(item)]
-        if len(uploaded) != 1 or uploaded[0].get('size') != source.stat().st_size:
+        self._run(['upload', str(source.resolve()), destination, '--max_upload_parallel', '2'])
+        uploaded = [item for item in self._list(remote_dir) if item.get('file_name') == filename]
+        if (
+            len(uploaded) != 1
+            or uploaded[0].get('dir') is not False
+            or uploaded[0].get('size') != source.stat().st_size
+            or not uploaded[0].get('fid')
+        ):
             raise ArchiveStorageError('夸克上传后的文件大小或数量校验未通过')
         return str(uploaded[0]['fid'])

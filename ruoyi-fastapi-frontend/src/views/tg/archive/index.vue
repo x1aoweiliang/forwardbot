@@ -2,7 +2,11 @@
   <div class="app-container archive-library">
     <div class="library-heading">
       <div><h2>素材库</h2><p>自动收集群消息，在这里整理并归档图片、视频和原文。</p></div>
-      <el-button v-hasPermi="['tg:archive:write']" type="primary" :disabled="!selected.length" @click="openArchive(selected)">归档所选 {{ selected.length || '' }}</el-button>
+      <div class="library-actions" v-hasPermi="['tg:archive:write']">
+        <el-button v-if="quarkStorages.length" @click="openQuark">夸克账号</el-button>
+        <el-button type="danger" plain :disabled="!selected.length" :loading="cleaning" @click="cleanupLocal(selected)">清理所选本地素材</el-button>
+        <el-button type="primary" :disabled="!selected.length || selected.some(row => row.downloadState !== 'ready')" @click="openArchive(selected)">归档所选 {{ selected.length || '' }}</el-button>
+      </div>
     </div>
     <el-form :inline="true" @submit.prevent="search">
       <el-form-item label="账号"><el-select v-model="query.accountId" clearable placeholder="全部账号" @change="changeAccount">
@@ -17,8 +21,8 @@
       <el-form-item><el-input v-model="query.keyword" placeholder="搜索原文" clearable @keyup.enter="search" /></el-form-item>
       <el-form-item><el-button type="primary" @click="search">搜索</el-button><el-button @click="refresh">刷新</el-button></el-form-item>
     </el-form>
-    <el-table v-loading="loading" :data="rows" row-key="messageId" @selection-change="selected = $event">
-      <el-table-column type="selection" width="48" :reserve-selection="true" :selectable="row => row.downloadState === 'ready'" />
+    <el-table ref="libraryTable" v-loading="loading" :data="rows" row-key="messageId" @selection-change="selected = $event">
+      <el-table-column type="selection" width="48" :reserve-selection="true" />
       <el-table-column label="消息" min-width="300"><template #default="{ row }">
         <el-button link type="primary" @click="openDetail(row)">{{ row.sourceChatTitle || row.sourceChatId }} · #{{ row.telegramMessageId }}</el-button>
         <p class="message-excerpt">{{ row.messageText || '无文字说明' }}</p>
@@ -29,10 +33,11 @@
       <el-table-column label="下载" width="120"><template #default="{ row }"><el-tag :type="tagType(row.downloadState)">{{ label(row.downloadState) }}</el-tag></template></el-table-column>
       <el-table-column label="归档" width="110"><template #default="{ row }"><el-tag :type="row.archived ? 'success' : 'info'">{{ row.archived ? '已归档' : '待归档' }}</el-tag></template></el-table-column>
       <el-table-column label="消息时间" width="180"><template #default="{ row }">{{ parseTime(row.sentAt || row.createTime) }}</template></el-table-column>
-      <el-table-column label="操作" width="180"><template #default="{ row }">
+      <el-table-column label="操作" width="290"><template #default="{ row }">
         <el-button link type="primary" @click="openDetail(row)">查看</el-button>
         <el-button v-hasPermi="['tg:archive:write']" link type="primary" :disabled="row.downloadState !== 'ready'" @click="openArchive([row])">归档</el-button>
-        <el-button v-if="row.downloadState === 'failed'" v-hasPermi="['tg:archive:write']" link type="warning" @click="retryDownload(row.messageId)">重试</el-button>
+        <el-button v-if="['failed', 'deleted'].includes(row.downloadState)" v-hasPermi="['tg:archive:write']" link type="warning" @click="retryDownload(row.messageId)">{{ row.downloadState === 'deleted' ? '重新下载' : '重试' }}</el-button>
+        <el-button v-hasPermi="['tg:archive:write']" link type="danger" :disabled="cleaning || !row.mediaCount" @click="cleanupLocal([row])">清理本地</el-button>
       </template></el-table-column>
       <template #empty><el-empty description="还没有采集记录。在监听规则中开启自动下载后，新消息会出现在这里。" /></template>
     </el-table>
@@ -58,7 +63,8 @@
           </article>
         </div>
         <div class="detail-actions">
-          <el-button v-hasPermi="['tg:archive:write']" :disabled="!detail.medias.some(m => ['failed', 'retry'].includes(m.downloadStatus))" @click="retryDownload(detail.messageId)">重试失败下载</el-button>
+          <el-button v-hasPermi="['tg:archive:write']" :disabled="!detail.medias.some(m => ['failed', 'retry', 'deleted'].includes(m.downloadStatus)) || detail.medias.some(m => m.downloadStatus === 'deleting')" @click="retryDownload(detail.messageId)">{{ detail.medias.some(m => m.downloadStatus === 'deleted') ? '重新下载已清理素材' : '重试失败下载' }}</el-button>
+          <el-button v-hasPermi="['tg:archive:write']" type="danger" plain :loading="cleaning" :disabled="!detail.medias.length" @click="cleanupLocal([detail])">清理本地素材</el-button>
           <el-button v-hasPermi="['tg:archive:write']" type="primary" :disabled="!detailReady" @click="openArchive([detail])">归档这条消息</el-button>
         </div>
         <h3>归档记录</h3>
@@ -73,6 +79,20 @@
         </article>
       </div>
     </el-drawer>
+
+    <el-dialog v-model="quarkOpen" title="夸克账号" width="440px" @closed="closeQuark" :close-on-click-modal="false">
+      <el-select v-model="quarkStorageId" style="width:100%" :disabled="quarkLoading" @change="checkQuark">
+        <el-option v-for="storage in quarkStorages" :key="storage.id" :value="storage.id" :label="storage.name" />
+      </el-select>
+      <div v-loading="quarkLoading" class="quark-login">
+        <el-alert v-if="quarkError" :title="quarkError" type="error" :closable="false" />
+        <p v-if="quarkStatus.loggedIn">已登录：{{ quarkStatus.nickname }}</p>
+        <template v-if="qrImage"><img :src="qrImage" alt="夸克登录二维码" width="240" height="240" /><p>使用夸克 App 扫码并确认登录，二维码 5 分钟内有效。</p></template>
+        <p v-else-if="!quarkStatus.loggedIn && !quarkLoading">扫码后可浏览网盘目录并上传素材。</p>
+        <el-button type="primary" :disabled="!quarkStorageId || quarkLoading" @click="startQuarkLogin">{{ qrImage ? '刷新二维码' : quarkStatus.loggedIn ? '重新扫码登录' : '获取登录二维码' }}</el-button>
+      </div>
+      <p class="quark-note">登录凭据仅保存在服务器。重新登录请使用同一个夸克账号。</p>
+    </el-dialog>
 
     <el-dialog v-model="archiveOpen" title="归档素材" width="620px" :close-on-click-modal="false">
       <p>将 {{ archiveIds.length }} 条消息的原文和全部已采集素材上传，每条消息会放入独立子目录。</p>
@@ -101,6 +121,7 @@
 import { accountApi, archiveApi, chatApi } from '@/api/tg';
 
 const { proxy } = getCurrentInstance();
+const libraryTable = ref(null), cleaning = ref(false);
 const rows = ref([]), total = ref(0), selected = ref([]), loading = ref(false);
 const accounts = ref([]), chats = ref([]), storageOptions = ref([]);
 const query = reactive({ pageNum: 1, pageSize: 20, state: undefined, keyword: '', accountId: undefined, sourceChatPk: undefined });
@@ -108,13 +129,17 @@ const detailOpen = ref(false), detailLoading = ref(false), detail = ref(null), p
 const archiveOpen = ref(false), archiveIds = ref([]), archiveForm = reactive({ storageId: '' });
 const folderPath = ref(''), folderOptions = ref([]), foldersLoading = ref(false), folderError = ref('');
 const newFolderOpen = ref(false), newFolderName = ref(''), creatingFolder = ref(false), submitting = ref(false), preparingArchive = ref(false);
+const quarkOpen = ref(false), quarkStorageId = ref(''), quarkStatus = ref({}), quarkLoading = ref(false), quarkError = ref(''), qrImage = ref('');
+const quarkStorages = computed(() => storageOptions.value.filter(item => item.type === 'quark'));
+let qrTimer, qrSession = null, quarkSequence = 0;
 let pollTimer, disposed = false, librarySequence = 0, folderSequence = 0, detailSequence = 0;
 const filters = [
   { value: 'unarchived', label: '待归档' }, { value: 'ready', label: '下载完成' },
   { value: 'pending', label: '正在下载 / 等待' }, { value: 'failed', label: '下载失败' },
+  { value: 'deleted', label: '本地已清理' }, { value: 'deleting', label: '清理中 / 待重试' },
   { value: 'archived', label: '已归档' }, { value: 'blocked', label: '已拦截' },
 ];
-const labels = { ready: '已就绪', pending: '下载中 / 等待', failed: '失败', blocked: '已拦截', queued: '排队中', downloading: '下载中', retry: '等待重试', skipped: '非图片或视频', completed: '已完成', uploading: '上传中', disabled: '未开启' };
+const labels = { deleted: '本地已清理', deleting: '清理中 / 待重试', ready: '已就绪', pending: '下载中 / 等待', failed: '失败', blocked: '已拦截', queued: '排队中', downloading: '下载中', retry: '等待重试', skipped: '非图片或视频', completed: '已完成', uploading: '上传中', disabled: '未开启' };
 const detailReady = computed(() => detail.value && detail.value.isSensitive !== 'Y' && detail.value.medias.every(m => ['ready', 'skipped'].includes(m.downloadStatus)));
 const label = value => labels[value] || value;
 const tagType = value => ['ready', 'completed'].includes(value) ? 'success' : value === 'failed' ? 'danger' : ['blocked', 'retry'].includes(value) ? 'warning' : 'info';
@@ -139,7 +164,7 @@ async function loadPreview(media, force = false) {
   if (media.downloadStatus !== 'ready' || (!force && previewUrls[media.mediaId])) return;
   const messageId = detail.value?.messageId;
   const result = await archiveApi.ticket(media.mediaId);
-  if (detailOpen.value && detail.value?.messageId === messageId) previewUrls[media.mediaId] = archiveApi.contentUrl(media.mediaId, result.data.ticket);
+  if (detailOpen.value && detail.value?.messageId === messageId && detail.value.medias.some(item => item.mediaId === media.mediaId && item.downloadStatus === 'ready')) previewUrls[media.mediaId] = archiveApi.contentUrl(media.mediaId, result.data.ticket);
 }
 async function refreshDetail() {
   if (!detail.value || !detailOpen.value) return;
@@ -147,6 +172,7 @@ async function refreshDetail() {
   const result = await archiveApi.detail(id);
   if (sequence !== detailSequence || !detailOpen.value) return;
   detail.value = result.data;
+  detail.value.medias.filter(media => media.downloadStatus !== 'ready').forEach(media => delete previewUrls[media.mediaId]);
   await Promise.allSettled(detail.value.medias.map(media => loadPreview(media)));
 }
 async function openDetail(row) {
@@ -156,6 +182,67 @@ async function openDetail(row) {
 function clearDetail() { detailSequence++; detail.value = null; Object.keys(previewUrls).forEach(key => delete previewUrls[key]); }
 async function retryDownload(id) { const result = await archiveApi.retryDownload(id); proxy.$modal.msgSuccess(result.msg); await Promise.all([refresh(true), refreshDetail()]); }
 async function retryArchive(id) { const result = await archiveApi.retryArchive(id); proxy.$modal.msgSuccess(result.msg); await refreshDetail(); }
+async function cleanupLocal(messages) {
+  const ids = messages.map(item => item.messageId);
+  const unarchived = messages.some(item => item.archived !== true && !item.archives?.some(task => task.status === 'completed' && task.mediaRevision === item.mediaRevision));
+  try {
+    await proxy.$modal.confirm(`将删除 ${ids.length} 条消息的本地图片、视频和下载残片，保留文字及云端归档。${unarchived ? '其中包含尚未归档的消息，清理后只能在源消息仍可访问时重新下载。' : '需要时可手动重新下载。'}确认清理？`);
+  } catch { return; }
+  cleaning.value = true;
+  try {
+    const result = await archiveApi.cleanup({ messageIds: ids });
+    libraryTable.value?.clearSelection(); selected.value = [];
+    Object.keys(previewUrls).forEach(key => delete previewUrls[key]);
+    const message = `${result.msg}，本次删除文件 ${formatBytes(result.data.freedBytes)}`;
+    if (result.data.errors.length) proxy.$modal.msgWarning(message); else proxy.$modal.msgSuccess(message);
+    await Promise.all([refresh(true), refreshDetail()]);
+  } finally { cleaning.value = false; }
+}
+function cancelQr() {
+  clearTimeout(qrTimer);
+  const session = qrSession; qrSession = null; qrImage.value = '';
+  if (session) archiveApi.quarkCancel(session.storageId, session.id).catch(() => {});
+}
+function closeQuark() { quarkSequence++; cancelQr(); quarkLoading.value = false; }
+async function openQuark() {
+  quarkStorageId.value = quarkStorages.value.some(item => item.id === quarkStorageId.value) ? quarkStorageId.value : quarkStorages.value[0]?.id || '';
+  quarkOpen.value = true; await checkQuark();
+}
+async function checkQuark() {
+  const sequence = ++quarkSequence;
+  cancelQr(); quarkStatus.value = {}; quarkError.value = ''; quarkLoading.value = true;
+  try {
+    const result = await archiveApi.quarkStatus(quarkStorageId.value);
+    if (sequence === quarkSequence) { quarkStatus.value = result.data; quarkError.value = result.data.message || ''; }
+  } catch (error) { if (sequence === quarkSequence) quarkError.value = error.message || '登录状态读取失败'; }
+  finally { if (sequence === quarkSequence) quarkLoading.value = false; }
+}
+async function startQuarkLogin() {
+  const sequence = ++quarkSequence, storageId = quarkStorageId.value;
+  cancelQr(); quarkError.value = ''; quarkLoading.value = true;
+  try {
+    const result = await archiveApi.quarkLogin(storageId);
+    if (sequence !== quarkSequence || !quarkOpen.value) { await archiveApi.quarkCancel(storageId, result.data.sessionId); return; }
+    qrSession = { id: result.data.sessionId, storageId, expires: Date.now() + result.data.expiresIn * 1000 };
+    qrImage.value = result.data.image; qrTimer = setTimeout(() => pollQuark(sequence), 2000);
+  } catch (error) { if (sequence === quarkSequence) quarkError.value = error.message || '获取二维码失败'; }
+  finally { if (sequence === quarkSequence) quarkLoading.value = false; }
+}
+async function pollQuark(sequence) {
+  if (sequence !== quarkSequence || !quarkOpen.value || !qrSession) return;
+  if (Date.now() > qrSession.expires) { cancelQr(); quarkError.value = '二维码已过期，请重新获取'; return; }
+  try {
+    const result = await archiveApi.quarkPoll(qrSession.storageId, qrSession.id);
+    if (sequence !== quarkSequence || !quarkOpen.value) return;
+    if (result.data.status === 'authorized') {
+      cancelQr(); quarkStatus.value = { loggedIn: true, nickname: result.data.nickname }; proxy.$modal.msgSuccess('夸克登录成功');
+      if (archiveOpen.value && archiveForm.storageId === quarkStorageId.value) await browse(folderPath.value);
+      return;
+    }
+    if (result.data.status === 'expired') { cancelQr(); quarkError.value = '二维码已过期，请重新获取'; return; }
+    qrTimer = setTimeout(() => pollQuark(sequence), 2000);
+  } catch (error) { if (sequence === quarkSequence) { cancelQr(); quarkError.value = error.message || '登录验证失败，请重新扫码'; } }
+}
 async function openArchive(messages) {
   archiveIds.value = messages.map(item => item.messageId); preparingArchive.value = true; archiveOpen.value = true;
   folderPath.value = ''; folderOptions.value = []; newFolderOpen.value = false; newFolderName.value = ''; folderError.value = '';
@@ -193,11 +280,12 @@ onMounted(async () => {
   ]);
   if (!disposed) pollTimer = setInterval(() => { if (!document.hidden) Promise.allSettled([refresh(true), refreshDetail()]); }, 5000);
 });
-onUnmounted(() => { disposed = true; clearInterval(pollTimer); librarySequence++; folderSequence++; clearDetail(); });
+onUnmounted(() => { disposed = true; closeQuark(); clearInterval(pollTimer); librarySequence++; folderSequence++; clearDetail(); });
 </script>
 
 <style scoped>
 .library-heading,.record-heading,.folder-toolbar,.archive-file { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.library-actions { display:flex; gap:8px; flex-wrap:wrap; } .quark-login { min-height:160px; text-align:center; padding:20px 0; } .quark-login img { display:block; margin:12px auto; } .quark-note { color:var(--el-text-color-secondary); font-size:13px; }
 .library-heading { margin-bottom:24px; } h2 { margin:0 0 8px; font-size:24px; } .library-heading p,small { color:var(--el-text-color-secondary); }
 .library-heading p { margin:0; } .el-select { width:180px; }
 .message-excerpt { margin:6px 0; white-space:pre-wrap; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }

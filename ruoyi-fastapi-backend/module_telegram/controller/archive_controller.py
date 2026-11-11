@@ -11,7 +11,13 @@ from common.aspect.pre_auth import CurrentUserDependency, PreAuthDependency
 from common.router import APIRouterPro
 from exceptions.exception import ServiceException
 from module_admin.entity.vo.user_vo import CurrentUserModel
-from module_telegram.entity.vo.archive_vo import ArchiveFolderModel, ArchiveLibraryQuery, ArchiveSubmitModel
+from module_telegram.entity.vo.archive_vo import (
+    ArchiveCleanupModel,
+    ArchiveFolderModel,
+    ArchiveLibraryQuery,
+    ArchiveSubmitModel,
+)
+from module_telegram.service.archive_quark_auth import quark_login_service
 from module_telegram.service.archive_service import TelegramArchiveService
 from module_telegram.service.archive_storage import (
     ArchiveStorageError,
@@ -68,6 +74,54 @@ async def storages(request: Request) -> Response:
         )
     except ArchiveStorageError as exc:
         raise ServiceException(message=str(exc)) from exc
+
+
+@archive_controller.post('/local/cleanup', dependencies=[WritePermission])
+async def cleanup_local(
+    request: Request, item: ArchiveCleanupModel, db: Annotated[AsyncSession, DBSessionDependency()]
+) -> Response:
+    data = await TelegramArchiveService.cleanup_local(db, item.message_ids)
+    return ResponseUtil.success(data=data, msg='部分素材清理失败，可再次清理' if data['errors'] else '本地素材已清理')
+
+
+@archive_controller.get('/quark/{storage_id}/status', dependencies=[WritePermission])
+async def quark_status(request: Request, storage_id: str) -> Response:
+    try:
+        return ResponseUtil.success(data=await asyncio.to_thread(quark_login_service.status, storage_id))
+    except ArchiveStorageError as exc:
+        raise ServiceException(message=str(exc)) from exc
+
+
+@archive_controller.post('/quark/{storage_id}/login', dependencies=[WritePermission])
+async def quark_login(
+    request: Request, storage_id: str, user: Annotated[CurrentUserModel, CurrentUserDependency()]
+) -> Response:
+    try:
+        return ResponseUtil.success(
+            data=await asyncio.to_thread(quark_login_service.start, storage_id, user.user.user_id)
+        )
+    except ArchiveStorageError as exc:
+        raise ServiceException(message=str(exc)) from exc
+
+
+@archive_controller.get('/quark/{storage_id}/login/{session_id}', dependencies=[WritePermission])
+async def quark_poll(
+    request: Request, storage_id: str, session_id: str, user: Annotated[CurrentUserModel, CurrentUserDependency()]
+) -> Response:
+    try:
+        return ResponseUtil.success(
+            data=await asyncio.to_thread(quark_login_service.poll, storage_id, session_id, user.user.user_id)
+        )
+    except ArchiveStorageError as exc:
+        raise ServiceException(message=str(exc)) from exc
+
+
+@archive_controller.delete('/quark/{storage_id}/login/{session_id}', dependencies=[WritePermission])
+async def quark_cancel(
+    request: Request, storage_id: str, session_id: str, user: Annotated[CurrentUserModel, CurrentUserDependency()]
+) -> Response:
+    await asyncio.to_thread(quark_login_service.cancel, storage_id, session_id, user.user.user_id)
+    return ResponseUtil.success()
 
 
 @archive_controller.get('/folders', dependencies=[ReadPermission])
