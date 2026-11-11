@@ -42,6 +42,18 @@ class JwtSettings(BaseSettings):
     jwt_redis_expire_minutes: int = 30
 
 
+class ArchiveSettings(BaseSettings):
+    """独立采集服务的私有磁盘和后台任务配置。"""
+
+    archive_enabled: bool = False
+    archive_media_dir: str = 'vf_admin/archive/media'
+    archive_storages_file: str = 'vf_admin/archive/storages.json'
+    archive_min_free_bytes: int = 268435456
+    archive_poll_seconds: float = 3.0
+    archive_max_attempts: int = 5
+    archive_lease_seconds: int = 180
+
+
 class DataBaseSettings(BaseSettings):
     """
     数据库配置
@@ -333,3 +345,4 @@ TransportCryptoConfig = get_config.get_transport_crypto_config()
 GenConfig = get_config.get_gen_config()
 # 上传配置
 UploadConfig = get_config.get_upload_config()
+ArchiveConfig = ArchiveSettings()

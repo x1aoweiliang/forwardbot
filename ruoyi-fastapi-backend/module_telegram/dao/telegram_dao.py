@@ -121,6 +121,15 @@ class TelegramDao:
         return await cls.add_item(db, TgMessage, data)
 
     @classmethod
+    async def find_source_message(
+        cls, db: AsyncSession, account_id: int, chat_id: str, telegram_id: int, grouped_id: int | None
+    ) -> TgMessage | None:
+        identity = TgMessage.grouped_id == grouped_id if grouped_id else TgMessage.telegram_message_id == telegram_id
+        return (await db.execute(select(TgMessage).where(
+            TgMessage.account_id == account_id, TgMessage.source_chat_id == chat_id, identity
+        ).with_for_update())).scalars().first()
+
+    @classmethod
     async def update_message(cls, db: AsyncSession, data: dict[str, Any]) -> None:
         await cls.update_item(db, TgMessage, data)
 
@@ -151,6 +160,7 @@ class TelegramDao:
                         TgMessageMedia.create_time < cutoff_time,
                         TgMessageMedia.local_path.isnot(None),
                         TgMessageMedia.local_path != '',
+                        TgMessageMedia.storage_kind == 'cache',
                     )
                 )
             )

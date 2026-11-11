@@ -54,6 +54,7 @@ class TgChat(Base):
     can_listen = Column(CHAR(1), nullable=False, server_default='N', comment='是否可监听')
     can_send = Column(CHAR(1), nullable=False, server_default='N', comment='是否可发送')
     ad_text_id = Column(BigInteger, nullable=True, comment='目标群广告词ID')
+    collection_cursor = Column(BigInteger, nullable=True)
     status = Column(CHAR(1), nullable=False, server_default='0', comment='状态（0启用 1停用）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, default=datetime.now, comment='创建时间')
@@ -75,6 +76,8 @@ class TgListenerRule(Base):
     source_chat_pk = Column(BigInteger, nullable=False, comment='来源频道主键')
     source_chat_pks = Column(String(1000), nullable=True, comment='来源频道主键，逗号分隔')
     target_chat_pks = Column(String(1000), nullable=False, comment='目标频道主键，逗号分隔')
+    forward_enabled = Column(CHAR(1), nullable=False, server_default='Y')
+    download_enabled = Column(CHAR(1), nullable=False, server_default='N')
     forward_mode = Column(String(30), nullable=False, server_default='copy_clean', comment='转发方式：copy_clean清洗复制 native_hidden原生隐藏')
     rule_name = Column(String(100), nullable=False, comment='规则名称')
     status = Column(CHAR(1), nullable=False, server_default='0', comment='状态（0启用 1停用）')
@@ -152,6 +155,7 @@ class TgMessage(Base):
     __tablename__ = 'tg_message'
     __table_args__ = (
         UniqueConstraint('account_id', 'source_chat_id', 'telegram_message_id', name='uq_tg_message_source'),
+        UniqueConstraint('account_id', 'source_chat_id', 'grouped_id', name='uq_tg_message_album'),
         {'comment': 'Telegram监听消息表'},
     )
 
@@ -161,6 +165,9 @@ class TgMessage(Base):
     source_chat_id = Column(String(100), nullable=False, comment='来源Telegram Chat ID')
     source_chat_title = Column(String(255), nullable=True, comment='来源标题')
     telegram_message_id = Column(BigInteger, nullable=False, comment='Telegram消息ID')
+    grouped_id = Column(BigInteger, nullable=True, index=True)
+    collected = Column(CHAR(1), nullable=False, server_default='N', index=True)
+    media_revision = Column(Integer, nullable=False, server_default='1')
     message_text = Column(Text, nullable=True, comment='消息文本')
     sent_at = Column(DateTime, nullable=True, comment='Telegram发送时间')
     is_sensitive = Column(CHAR(1), nullable=False, server_default='N', comment='是否命中敏感词')
@@ -176,17 +183,31 @@ class TgMessageMedia(Base):
     """
 
     __tablename__ = 'tg_message_media'
-    __table_args__ = {'comment': 'Telegram消息媒体表'}
+    __table_args__ = (
+        UniqueConstraint('message_id', 'source_telegram_message_id', name='uq_tg_media_source'),
+        {'comment': 'Telegram消息媒体表'},
+    )
 
     media_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='媒体主键')
     message_id = Column(BigInteger, nullable=False, comment='消息ID')
     media_type = Column(String(30), nullable=False, comment='媒体类型')
     local_path = Column(String(500), nullable=False, server_default='', comment='本地相对路径')
     source_telegram_message_id = Column(BigInteger, nullable=True, comment='源Telegram媒体消息ID')
+    source_media_id = Column(BigInteger, nullable=True)
     media_index = Column(Integer, nullable=False, server_default='0', comment='媒体顺序')
     file_name = Column(String(255), nullable=True, comment='文件名')
     mime_type = Column(String(100), nullable=True, comment='MIME类型')
     file_size = Column(BigInteger, nullable=True, comment='文件大小')
+    caption = Column(Text, nullable=True)
+    storage_kind = Column(String(20), nullable=False, server_default='cache')
+    download_status = Column(String(30), nullable=False, server_default='disabled', index=True)
+    downloaded_bytes = Column(BigInteger, nullable=False, server_default='0')
+    sha256 = Column(String(64), nullable=True)
+    attempts = Column(Integer, nullable=False, server_default='0')
+    next_retry_at = Column(DateTime, nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    lease_token = Column(String(40), nullable=True)
+    last_error = Column(Text, nullable=True)
     create_time = Column(DateTime, nullable=True, default=datetime.now, comment='创建时间')
 
 

@@ -1,6 +1,6 @@
 import Cookies from 'js-cookie'
 
-const TokenKey = 'Admin-Token'
+const TokenKey = import.meta.env.VITE_AUTH_TOKEN_KEY || 'Admin-Token'
 
 export function getToken() {
   return Cookies.get(TokenKey)

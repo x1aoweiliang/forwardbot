@@ -41,6 +41,7 @@ class TelegramClientManager:
     _handlers: dict[int, list[Any]] = {}
     _album_buffers: dict[tuple[int, int, int], dict[int, Any]] = {}
     _album_flush_tasks: dict[tuple[int, int, int], asyncio.Task] = {}
+    _ingest_locks: dict[tuple[int, int], asyncio.Lock] = {}
     _album_flush_delay = 5.0
     _session_dir = Path('vf_admin/telegram_sessions')
 
@@ -227,24 +228,24 @@ class TelegramClientManager:
         if not messages:
             return
 
+        try:
+            await cls.persist_messages(account, source_chat, messages)
+        except Exception as exc:
+            logger.exception(f'Telegram相册处理失败: account_id={account.account_id}, error_type={type(exc).__name__}')
+
+    @classmethod
+    async def persist_messages(cls, account: Any, source_chat: Any, messages: list[Any]) -> None:
         from config.database import AsyncSessionLocal  # noqa: PLC0415
         from module_telegram.service.telegram_service import TelegramMessageIngestService  # noqa: PLC0415
 
-        async with AsyncSessionLocal() as handler_db:
-            try:
-                album_event = SimpleNamespace(
-                    messages=messages,
-                    raw_text=next((getattr(message, 'raw_text', None) for message in messages if getattr(message, 'raw_text', None)), None),
-                    text=next((getattr(message, 'text', None) for message in messages if getattr(message, 'text', None)), None),
-                )
-                await TelegramMessageIngestService.ingest_album(handler_db, account, source_chat, album_event)
-                await handler_db.commit()
-            except Exception as exc:
-                await handler_db.rollback()
-                logger.exception(
-                    f'Telegram聚合相册消息处理失败: account_id={account.account_id}, chat_id={source_chat.chat_id}, '
-                    f'grouped_id={key[2]}, error={exc}'
-                )
+        key = (int(account.account_id), int(source_chat.chat_pk))
+        async with cls._ingest_locks.setdefault(key, asyncio.Lock()), AsyncSessionLocal() as handler_db:
+            if len(messages) > 1 or getattr(messages[0], 'grouped_id', None):
+                event = SimpleNamespace(messages=messages)
+                await TelegramMessageIngestService.ingest_album(handler_db, account, source_chat, event)
+            else:
+                await TelegramMessageIngestService.ingest_event(handler_db, account, source_chat, SimpleNamespace(message=messages[0]))
+            await handler_db.commit()
 
     @classmethod
     async def _cancel_album_flush_tasks(cls, account_id: int | None = None) -> None:
@@ -286,16 +287,10 @@ class TelegramClientManager:
                 if getattr(event.message, 'grouped_id', None):
                     cls._queue_grouped_message(account, chat, event)
                     return
-                from config.database import AsyncSessionLocal  # noqa: PLC0415
-                from module_telegram.service.telegram_service import TelegramMessageIngestService  # noqa: PLC0415
-
-                async with AsyncSessionLocal() as handler_db:
-                    try:
-                        await TelegramMessageIngestService.ingest_event(handler_db, account, chat, event)
-                        await handler_db.commit()
-                    except Exception as exc:
-                        await handler_db.rollback()
-                        logger.exception(f'Telegram消息处理失败: account_id={account.account_id}, chat_id={chat.chat_id}, error={exc}')
+                try:
+                    await cls.persist_messages(account, chat, [event.message])
+                except Exception as exc:
+                    logger.exception(f'Telegram消息处理失败: account_id={account.account_id}, error_type={type(exc).__name__}')
 
             builder = events.NewMessage(chats=cls._normalize_chat_ref(source_chat.chat_id))
             client.add_event_handler(handler, builder)

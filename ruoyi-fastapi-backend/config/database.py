@@ -88,7 +88,7 @@ def create_async_session_local(engine: AsyncEngine) -> async_sessionmaker:
     :param engine: 异步 SQLAlchemy Engine
     :return: 异步 Session 工厂
     """
-    return async_sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    return async_sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 
 
 def create_sync_session_local(engine: Engine) -> sessionmaker:

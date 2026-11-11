@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from config.env import ArchiveConfig
+
 
 @dataclass(frozen=True)
 class SensitiveMatchResult:
@@ -139,6 +141,12 @@ class TelegramStorageService:
 
     def __init__(self, base_dir: str | Path = 'vf_admin/upload_path') -> None:
         self.base_dir = Path(base_dir)
+
+    @classmethod
+    def for_media(cls, media: Any) -> 'TelegramStorageService':
+        if getattr(media, 'storage_kind', 'cache') == 'archive':
+            return cls(ArchiveConfig.archive_media_dir)
+        return cls()
 
     def build_media_path(self, account_id: int, message_id: int, filename: str) -> StoragePath:
         safe_filename = Path(filename).name or 'telegram_media'

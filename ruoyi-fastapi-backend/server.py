@@ -7,13 +7,14 @@ from fastapi import FastAPI
 from common.constant import LockConstant
 from common.router import auto_register_routers
 from config.database import AsyncSessionLocal
-from config.env import AppConfig
+from config.env import AppConfig, ArchiveConfig
 from config.get_db import close_async_engine, init_create_table
 from config.get_redis import RedisUtil
 from config.get_scheduler import SchedulerUtil
 from exceptions.handle import handle_exception
 from middlewares.handle import handle_middleware
 from module_admin.service.log_service import LogAggregatorService
+from module_telegram.service.archive_worker import TelegramArchiveWorker
 from module_telegram.service.telegram_client_service import TelegramClientManager
 from sub_applications.handle import handle_sub_applications
 from utils.common_util import worship
@@ -32,9 +33,14 @@ async def _start_background_tasks(app: FastAPI) -> None:
     await SchedulerUtil.init_system_scheduler(app.state.redis)
     app.state.log_aggregator_task = asyncio.create_task(LogAggregatorService.consume_stream(app.state.redis))
 
-    if getattr(app.state, 'startup_log_enabled', False):
+    # Archive mode is restricted to one process. A stale logging lock after a
+    # restart must not leave its listener and durable queues permanently idle.
+    if ArchiveConfig.archive_enabled or getattr(app.state, 'startup_log_enabled', False):
         async with AsyncSessionLocal() as query_db:
             await TelegramClientManager.restore_enabled_listeners(query_db)
+        if ArchiveConfig.archive_enabled:
+            app.state.archive_worker = TelegramArchiveWorker()
+            app.state.archive_worker.start()
 
 
 async def _stop_background_tasks(app: FastAPI) -> None:
@@ -44,6 +50,9 @@ async def _stop_background_tasks(app: FastAPI) -> None:
     :param app: FastAPI对象
     :return: None
     """
+    archive_worker = getattr(app.state, 'archive_worker', None)
+    if archive_worker:
+        await archive_worker.stop()
     log_task = getattr(app.state, 'log_aggregator_task', None)
     if log_task:
         log_task.cancel()
@@ -73,6 +82,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     :param app: FastAPI对象
     :return: None
     """
+    if ArchiveConfig.archive_enabled and (AppConfig.app_workers != 1 or AppConfig.app_reload):
+        raise RuntimeError('采集服务要求 APP_WORKERS=1 且 APP_RELOAD=false，避免重复打开 Telegram session')
     app.state.redis = await RedisUtil.create_redis_pool(log_enabled=False)
     startup_log_enabled = await StartupUtil.acquire_startup_log_gate(
         redis=app.state.redis,

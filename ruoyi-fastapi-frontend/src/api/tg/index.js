@@ -70,3 +70,20 @@ export const forwardRecordApi = {
     return request({ url: "/telegram/forward-record/list", method: "get", params: query });
   },
 };
+
+export const archiveApi = {
+  library(params) { return request({ url: '/telegram/archive/library', params }); },
+  detail(id) { return request({ url: `/telegram/archive/message/${id}` }); },
+  retryDownload(id) { return request({ url: `/telegram/archive/message/${id}/retry`, method: 'post' }); },
+  storages() { return request({ url: '/telegram/archive/storages' }); },
+  folders(storageId, path) {
+    return request({ url: '/telegram/archive/folders', params: { storage_id: storageId, path }, timeout: 180000 });
+  },
+  createFolder(data) { return request({ url: '/telegram/archive/folders', method: 'post', data, timeout: 180000 }); },
+  submit(data) { return request({ url: '/telegram/archive/tasks', method: 'post', data }); },
+  retryArchive(id) { return request({ url: `/telegram/archive/tasks/${id}/retry`, method: 'post' }); },
+  ticket(id) { return request({ url: `/telegram/archive/media/${id}/ticket` }); },
+  contentUrl(id, ticket) {
+    return `${import.meta.env.VITE_APP_BASE_API}/telegram/archive/media/${id}/content?ticket=${encodeURIComponent(ticket)}`;
+  },
+};

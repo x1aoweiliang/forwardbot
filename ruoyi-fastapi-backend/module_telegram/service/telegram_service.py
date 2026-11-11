@@ -277,8 +277,15 @@ class TelegramCrudService:
         source_pks = ListenerRulePolicy.parse_chat_pks(data.get('source_chat_pks') or data.get('source_chat_pk'))
         if not source_pks:
             raise ServiceException(message='来源频道不能为空')
-        if not data.get('target_chat_pks'):
+        forward_enabled = data.get('forward_enabled', item.forward_enabled)
+        download_enabled = data.get('download_enabled', item.download_enabled)
+        if forward_enabled == 'N' and download_enabled == 'N':
+            raise ServiceException(message='请至少开启自动转发或自动下载')
+        if forward_enabled == 'Y' and not data.get('target_chat_pks'):
             raise ServiceException(message='目标频道不能为空')
+        data['forward_enabled'] = forward_enabled
+        data['download_enabled'] = download_enabled
+        data.setdefault('target_chat_pks', '')
         data['source_chat_pk'] = source_pks[0]
         data['source_chat_pks'] = ','.join(str(pk) for pk in source_pks)
         try:
@@ -652,8 +659,12 @@ class TelegramForwardService:
         storage = TelegramStorageService()
         file_paths = []
         for media in medias:
+            storage = TelegramStorageService.for_media(media) if getattr(media, 'storage_kind', 'cache') == 'archive' else TelegramStorageService()
             if getattr(media, 'local_path', None):
                 file_paths.append(str(storage.base_dir / media.local_path))
+                continue
+            if getattr(media, 'storage_kind', 'cache') == 'archive':
+                # Permanent collection files are written only by the download worker.
                 continue
             source_message_id = getattr(media, 'source_telegram_message_id', None)
             source_message = source_by_id.get(source_message_id)
@@ -855,24 +866,43 @@ class TelegramMessageIngestService:
         return getattr(message, 'file', None)
 
     @classmethod
-    async def _save_message_medias(cls, db: AsyncSession, db_message: TgMessage, messages: list[Any]) -> None:
-        for media_index, message in enumerate(messages):
-            if not getattr(message, 'media', None):
+    async def _save_message_medias(
+        cls, db: AsyncSession, db_message: TgMessage, messages: list[Any],
+        collect: bool = False, existing: list[Any] | None = None,
+    ) -> int:
+        existing_ids = {item.source_telegram_message_id for item in (existing or [])}
+        ordered_ids = sorted(existing_ids | {message.id for message in messages if getattr(message, 'media', None)})
+        indexes = {source_id: index for index, source_id in enumerate(ordered_ids)}
+        for item in existing or []:
+            item.media_index = indexes[item.source_telegram_message_id]
+        added = 0
+        for message in messages:
+            if not getattr(message, 'media', None) or message.id in existing_ids:
                 continue
             message_file = cls._message_file(message)
-            await TelegramDao.add_media(
-                db,
-                {
-                    'message_id': db_message.message_id,
-                    'media_type': 'media',
-                    'local_path': '',
-                    'source_telegram_message_id': getattr(message, 'id', None),
-                    'media_index': media_index,
-                    'file_name': getattr(message_file, 'name', None),
-                    'mime_type': getattr(message_file, 'mime_type', None),
-                    'file_size': getattr(message_file, 'size', None),
-                },
-            )
+            mime_type = getattr(message_file, 'mime_type', None)
+            downloadable = bool(mime_type and mime_type.startswith(('image/', 'video/')))
+            if getattr(message, 'photo', None) or getattr(message, 'video', None):
+                downloadable = True
+            media_data = {
+                'message_id': db_message.message_id,
+                'media_type': 'media',
+                'local_path': '',
+                'source_telegram_message_id': getattr(message, 'id', None),
+                'media_index': indexes[message.id],
+                'file_name': getattr(message_file, 'name', None),
+                'mime_type': mime_type,
+                'file_size': getattr(message_file, 'size', None),
+            }
+            if collect:
+                media_data.update(
+                    caption=cls._message_text(message), storage_kind='archive',
+                    source_media_id=getattr(getattr(message, 'photo', None) or getattr(message, 'document', None), 'id', None),
+                    download_status=('blocked' if db_message.is_sensitive == 'Y' else 'queued') if downloadable else 'skipped',
+                )
+            await TelegramDao.add_media(db, media_data)
+            added += 1
+        return added
 
     @classmethod
     async def _forward_source_message_by_rules(
@@ -884,7 +914,11 @@ class TelegramMessageIngestService:
         source_messages: list[Any],
     ) -> None:
         rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
-        matched_rules = [rule for rule in rules if source_chat.chat_pk in ListenerRulePolicy.source_chat_pks(rule)]
+        matched_rules = [
+            rule for rule in rules
+            if source_chat.chat_pk in ListenerRulePolicy.source_chat_pks(rule)
+            and getattr(rule, 'forward_enabled', 'Y') == 'Y'
+        ]
         for rule in matched_rules:
             target_pks = ListenerRulePolicy.parse_chat_pks(rule.target_chat_pks)
             targets = await TelegramDao.get_chats_by_pks(db, target_pks)
@@ -914,82 +948,77 @@ class TelegramMessageIngestService:
 
     @classmethod
     async def ingest_event(cls, db: AsyncSession, account: TgAccount, source_chat: TgChat, event: Any) -> TgMessage:
-        message_text = cls._message_text(event.message)
-        sent_at = cls._normalize_sent_at(getattr(event.message, 'date', None))
-        words = await TelegramDao.get_enabled_words(db)
-        matcher = SensitiveWordMatcher(words, match_case=False)
-        match_result = matcher.match(message_text)
-        db_message = await TelegramDao.add_message(
-            db,
-            {
-                'account_id': account.account_id,
-                'source_chat_pk': source_chat.chat_pk,
-                'source_chat_id': source_chat.chat_id,
-                'source_chat_title': source_chat.chat_title,
-                'telegram_message_id': event.message.id,
-                'message_text': message_text,
-                'sent_at': sent_at,
-                'is_sensitive': 'Y' if match_result.is_blocked else 'N',
-                'sensitive_word': match_result.hit_word,
-                'auto_forward_status': 'blocked' if match_result.is_blocked else 'pending',
-            },
-        )
-        await db.flush()
-        await cls._save_message_medias(db, db_message, [event.message])
-        if match_result.is_blocked:
-            return db_message
-        try:
-            await cls._forward_source_message_by_rules(db, account, source_chat, db_message, [event.message])
-        except Exception:
-            await TelegramDao.update_message(
-                db,
-                {
-                    'message_id': db_message.message_id,
-                    'auto_forward_status': 'partial_failed',
-                    'update_time': datetime.now(),
-                },
-            )
-        return db_message
+        return await cls._ingest(db, account, source_chat, [event.message], cls._message_text(event.message))
 
     @classmethod
     async def ingest_album(cls, db: AsyncSession, account: TgAccount, source_chat: TgChat, event: Any) -> TgMessage:
         messages = sorted(getattr(event, 'messages', None) or [], key=lambda message: getattr(message, 'id', 0) or 0)
         if not messages:
             return await cls.ingest_event(db, account, source_chat, event)
-        first_message = messages[0]
-        message_text = cls._album_text(event, messages)
-        sent_at = cls._normalize_sent_at(getattr(first_message, 'date', None))
-        words = await TelegramDao.get_enabled_words(db)
-        matcher = SensitiveWordMatcher(words, match_case=False)
-        match_result = matcher.match(message_text)
-        db_message = await TelegramDao.add_message(
-            db,
-            {
-                'account_id': account.account_id,
-                'source_chat_pk': source_chat.chat_pk,
-                'source_chat_id': source_chat.chat_id,
-                'source_chat_title': source_chat.chat_title,
-                'telegram_message_id': first_message.id,
-                'message_text': message_text,
-                'sent_at': sent_at,
-                'is_sensitive': 'Y' if match_result.is_blocked else 'N',
-                'sensitive_word': match_result.hit_word,
-                'auto_forward_status': 'blocked' if match_result.is_blocked else 'pending',
-            },
-        )
-        await db.flush()
-        await cls._save_message_medias(db, db_message, messages)
-        if match_result.is_blocked:
+        return await cls._ingest(db, account, source_chat, messages, cls._album_text(event, messages))
+
+    @classmethod
+    async def _ingest(
+        cls, db: AsyncSession, account: TgAccount, source_chat: TgChat, messages: list[Any], message_text: str | None,
+    ) -> TgMessage:
+        first = messages[0]
+        grouped_id = getattr(first, 'grouped_id', None)
+        rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
+        matched = [rule for rule in rules if source_chat.chat_pk in ListenerRulePolicy.source_chat_pks(rule)]
+        collect = any(getattr(rule, 'download_enabled', 'N') == 'Y' for rule in matched)
+        db_message = await TelegramDao.find_source_message(db, account.account_id, source_chat.chat_id, first.id, grouped_id)
+        if db_message:
+            # Catch-up and repeated events must never resend an already ingested message.
+            if grouped_id:
+                text_changed = False
+                if not db_message.message_text and message_text:
+                    words = await TelegramDao.get_enabled_words(db)
+                    match = SensitiveWordMatcher(words, match_case=False).match(message_text)
+                    db_message.message_text = message_text
+                    text_changed = True
+                    if match.is_blocked:
+                        db_message.is_sensitive, db_message.sensitive_word = 'Y', match.hit_word
+                        db_message.auto_forward_status = 'blocked'
+                existing = await TelegramDao.get_media_by_message_id(db, db_message.message_id)
+                if db_message.is_sensitive == 'Y':
+                    for media in existing:
+                        if media.download_status in {'queued', 'retry', 'downloading', 'failed'}:
+                            media.download_status = 'blocked'
+                            media.lease_token = None
+                            media.lease_until = None
+                            media.next_retry_at = None
+                added = await cls._save_message_medias(db, db_message, messages, db_message.collected == 'Y', existing)
+                if added or text_changed:
+                    db_message.media_revision += 1
+                    db_message.update_time = datetime.now()
             return db_message
-        try:
-            await cls._forward_source_message_by_rules(db, account, source_chat, db_message, messages)
-        except Exception:
-            await TelegramDao.update_message(
-                db,
-                {
+        words = await TelegramDao.get_enabled_words(db)
+        match_result = SensitiveWordMatcher(words, match_case=False).match(message_text)
+        forwarding = any(getattr(rule, 'forward_enabled', 'Y') == 'Y' for rule in matched)
+        db_message = await TelegramDao.add_message(db, {
+            'account_id': account.account_id,
+            'source_chat_pk': source_chat.chat_pk,
+            'source_chat_id': source_chat.chat_id,
+            'source_chat_title': source_chat.chat_title,
+            'telegram_message_id': first.id,
+            'grouped_id': grouped_id,
+            'collected': 'Y' if collect else 'N',
+            'media_revision': 1,
+            'message_text': message_text,
+            'sent_at': cls._normalize_sent_at(getattr(first, 'date', None)),
+            'is_sensitive': 'Y' if match_result.is_blocked else 'N',
+            'sensitive_word': match_result.hit_word,
+            'auto_forward_status': 'blocked' if match_result.is_blocked else 'pending' if forwarding else 'disabled',
+        })
+        await db.flush()
+        await cls._save_message_medias(db, db_message, messages, collect)
+        if not match_result.is_blocked and forwarding:
+            try:
+                await cls._forward_source_message_by_rules(db, account, source_chat, db_message, messages)
+            except Exception:
+                await TelegramDao.update_message(db, {
                     'message_id': db_message.message_id,
                     'auto_forward_status': 'partial_failed',
                     'update_time': datetime.now(),
-                },
-            )
+                })
         return db_message

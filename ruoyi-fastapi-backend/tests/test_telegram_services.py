@@ -28,6 +28,19 @@ from module_telegram.service.telegram_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def fresh_message_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These unit tests exercise first delivery; replay is covered by database-backed archive tests."""
+    async def no_previous(*args: object) -> None:
+        return None
+
+    async def no_rules(*args: object) -> list:
+        return []
+
+    monkeypatch.setattr('module_telegram.dao.telegram_dao.TelegramDao.find_source_message', no_previous)
+    monkeypatch.setattr('module_telegram.dao.telegram_dao.TelegramDao.get_enabled_rules_for_account', no_rules)
+
+
 def test_sensitive_word_matcher_returns_first_enabled_hit() -> None:
     matcher = SensitiveWordMatcher(['spam', '诈骗', '忽略'])
 
@@ -1336,6 +1349,7 @@ def test_save_rule_normalizes_multiple_source_chats(monkeypatch: pytest.MonkeyPa
         result = await TelegramCrudService.save_rule(
             FakeDb(),
             SimpleNamespace(
+                forward_enabled='Y', download_enabled='N',
                 model_dump=lambda exclude_unset, exclude_none: {
                     'account_id': 1,
                     'rule_name': 'multi source',

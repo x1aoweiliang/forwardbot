@@ -1,0 +1,19 @@
+[
+  {
+    "id": "quark",
+    "name": "夸克素材库",
+    "type": "quark",
+    "cli_path": "/opt/quark/scripts/quark-drive.cjs",
+    "root_fid": "0"
+  },
+  {
+    "id": "s3",
+    "name": "S3 素材库",
+    "type": "s3",
+    "bucket": "replace-with-your-bucket",
+    "prefix": "telegram-archive",
+    "region": "us-east-1",
+    "access_key_env": "ARCHIVE_S3_ACCESS_KEY",
+    "secret_key_env": "ARCHIVE_S3_SECRET_KEY"
+  }
+]

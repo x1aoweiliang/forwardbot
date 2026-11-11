@@ -80,6 +80,8 @@ class TgListenerRuleModel(TelegramBaseModel):
     source_chat_pk: int | None = Field(default=None, description='来源频道主键')
     source_chat_pks: str | None = Field(default=None, description='来源频道主键，逗号分隔')
     target_chat_pks: str | None = Field(default=None, description='目标频道主键，逗号分隔')
+    forward_enabled: Literal['Y', 'N'] = 'Y'
+    download_enabled: Literal['Y', 'N'] = 'N'
     forward_mode: Literal['copy_clean', 'native_hidden'] | None = Field(default='copy_clean', description='转发方式')
     rule_name: str | None = Field(default=None, description='规则名称')
     status: Literal['0', '1'] | None = Field(default='0', description='状态')

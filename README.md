@@ -1,3 +1,5 @@
+本分支提供独立的 Telegram 素材采集与云端归档应用，部署说明见 [独立采集部署](deploy/archive/README.md)。
+
 <h1 align="center">
     <img alt="logo" src="https://oscimg.oschina.net/oscnet/up-d3d0a9303e11d522a06cd263f3079027715.png">
 </h1>
