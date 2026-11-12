@@ -1,5 +1,4 @@
 import asyncio
-import json
 import shutil
 import time
 import uuid
@@ -16,7 +15,7 @@ from config.env import ArchiveConfig
 from module_telegram.dao.telegram_dao import TelegramDao
 from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveTask
 from module_telegram.entity.do.telegram_do import TgAccount, TgChat, TgForwardRecord, TgMessage, TgMessageMedia
-from module_telegram.service.archive_service import file_sha256, manifest_files, media_filename, private_path
+from module_telegram.service.archive_service import file_sha256, media_filename, message_media_filenames, private_path
 from module_telegram.service.archive_storage import ArchiveStorageError, child_path, get_storage
 from module_telegram.service.media_runtime import media_runtime, run_blocking
 from module_telegram.service.telegram_client_service import TelegramClientManager
@@ -286,8 +285,8 @@ class TelegramArchiveWorker:
             async with AsyncSessionLocal() as db:
                 # Cleanup and late sensitive captions share this lock. A revoked
                 # downloader must not recreate files after cleanup has finished.
-                await db.scalar(
-                    select(TgMessage.message_id).where(TgMessage.message_id == job['message_id']).with_for_update()
+                message = await db.scalar(
+                    select(TgMessage).where(TgMessage.message_id == job['message_id']).with_for_update()
                 )
                 active = await db.scalar(
                     select(TgMessageMedia.media_id)
@@ -300,6 +299,11 @@ class TelegramArchiveWorker:
                 )
                 if active is None:
                     raise asyncio.CancelledError
+                medias = list(await db.scalars(
+                    select(TgMessageMedia).where(TgMessageMedia.message_id == job['message_id'])
+                ))
+                filename = message_media_filenames(message, medias)[job['media_id']]
+                path = storage.build_media_path(account_data.account_id, job['message_id'], filename)
                 partial.replace(path.absolute_path)
                 await db.execute(
                     update(TgMessageMedia)
@@ -325,33 +329,36 @@ class TelegramArchiveWorker:
                 if not message or message.is_sensitive == 'Y':
                     raise ArchiveStorageError('来源消息不存在或已被敏感词拦截')
             storage = await run_blocking(get_storage, job['storage_id'])
-            destination = child_path(job['target_path'], job['package_name'])
+            # Previously submitted tasks retain their recorded destination.
+            destination = child_path(job['target_path'], job['package_name']) if job['package_name'] else job['target_path']
             await run_blocking(storage.ensure_dir, destination)
-            manifest = json.loads(job['manifest_json'])
-            workdir = private_path(f'.tasks/{job["task_id"]}')
-            workdir.mkdir(parents=True, exist_ok=True)
-            for filename, content in manifest_files(manifest).items():
-                (workdir / filename).write_bytes(content)
             async with AsyncSessionLocal() as db:
+                # Legacy pending sidecars are no longer generated or uploaded.
+                await db.execute(update(TgArchiveItem).where(
+                    TgArchiveItem.task_id == job['task_id'], TgArchiveItem.media_id.is_(None),
+                    TgArchiveItem.status != 'completed',
+                ).values(status='skipped', last_error=None))
                 items = [
                     row_values(item)
                     for item in (
                         await db.execute(
                             select(TgArchiveItem)
-                            .where(TgArchiveItem.task_id == job['task_id'], TgArchiveItem.status != 'completed')
+                            .where(
+                                TgArchiveItem.task_id == job['task_id'], TgArchiveItem.status != 'completed',
+                                TgArchiveItem.media_id.is_not(None),
+                            )
                             .order_by(TgArchiveItem.item_id)
                         )
                     ).scalars()
                 ]
+                await db.commit()
             for item in items:
-                source = workdir / item['file_name']
-                if item['media_id']:
-                    async with AsyncSessionLocal() as db:
-                        media = await db.get(TgMessageMedia, item['media_id'])
-                        relative_path = media.local_path if media and media.download_status == 'ready' else ''
-                    if not relative_path:
-                        raise ArchiveStorageError('待上传的本地素材不可用')
-                    source = private_path(relative_path)
+                async with AsyncSessionLocal() as db:
+                    media = await db.get(TgMessageMedia, item['media_id'])
+                    relative_path = media.local_path if media and media.download_status == 'ready' else ''
+                if not relative_path:
+                    raise ArchiveStorageError('待上传的本地素材不可用')
+                source = private_path(relative_path)
                 if (
                     not source.is_file()
                     or source.stat().st_size != item['file_size']

@@ -36,9 +36,33 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def media_filename(source_message_id: int, mime_type: str | None) -> str:
+def media_filename(
+    source_message_id: int, mime_type: str | None, text: str | None = None, sequence: int | None = None,
+) -> str:
     suffix = mimetypes.guess_extension(mime_type or '') or '.bin'
-    return f'{source_message_id}{".jpg" if suffix == ".jpe" else suffix}'
+    suffix = '.jpg' if suffix == '.jpe' else suffix
+    stem = ' '.join((text or '').split())
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', '_', stem).strip(' .')
+    if stem.lower().endswith(suffix):
+        stem = stem[:-len(suffix)].strip(' .')
+    # Leave space for the extension, album index and archive collision suffix.
+    stem = stem.encode('utf-8')[:140].decode('utf-8', errors='ignore').rstrip(' .') or str(source_message_id)
+    return f'{stem}{f"_{sequence:02d}" if sequence is not None else ""}{suffix}'
+
+
+def message_media_filenames(message: TgMessage, medias: list[TgMessageMedia]) -> dict[int, str]:
+    files = sorted(
+        (media for media in medias if media.storage_kind == 'archive'),
+        key=lambda media: media.source_telegram_message_id,
+    )
+    return {
+        media.media_id: media_filename(
+            media.source_telegram_message_id, media.mime_type,
+            (media.caption or '').strip() or message.message_text,
+            index if len(files) > 1 or message.grouped_id else None,
+        )
+        for index, media in enumerate(files, 1)
+    }
 
 
 def cleanup_paths(account_id: int, message_id: int, media: TgMessageMedia) -> list[Path]:
@@ -55,13 +79,6 @@ def cleanup_paths(account_id: int, message_id: int, media: TgMessageMedia) -> li
     if any(path.resolve() != path for path in paths):
         raise ServiceException(message='素材路径含符号链接，已停止清理')
     return sorted(paths)
-
-
-def manifest_files(manifest: dict[str, Any]) -> dict[str, bytes]:
-    return {
-        'message.txt': manifest['text'].encode('utf-8'),
-        'metadata.json': json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode('utf-8'),
-    }
 
 
 class TelegramArchiveService:
@@ -194,10 +211,11 @@ class TelegramArchiveService:
             else []
         )
         data = CamelCaseUtil.transform_result(message)
+        filenames = message_media_filenames(message, medias)
         data['medias'] = [
             {
                 'mediaId': media.media_id,
-                'fileName': media.file_name or f'素材 {index + 1}',
+                'fileName': filenames.get(media.media_id) or media.file_name or f'素材 {index + 1}',
                 'mimeType': media.mime_type,
                 'fileSize': media.file_size,
                 'downloadStatus': media.download_status,
@@ -339,8 +357,26 @@ class TelegramArchiveService:
         target_path = normalize_path(request.target_path)
         if request.storage_id not in {item.id for item in load_storages()}:
             raise ServiceException(message='存储目标尚未配置')
+        ids = set(request.message_ids)
+        ordered_ids = list(await db.scalars(
+            select(TgMessage.message_id).where(TgMessage.message_id.in_(ids)).order_by(
+                func.coalesce(TgMessage.sent_at, TgMessage.create_time),
+                TgMessage.telegram_message_id, TgMessage.message_id,
+            )
+        ))
+        if len(ordered_ids) != len(ids):
+            raise ServiceException(message='部分采集记录不存在')
+        reserved = dict((await db.execute(
+            select(TgArchiveItem.file_name, TgArchiveItem.media_id)
+            .join(TgArchiveTask, TgArchiveTask.task_id == TgArchiveItem.task_id)
+            .where(
+                TgArchiveTask.storage_id == request.storage_id,
+                TgArchiveTask.target_path == target_path,
+                TgArchiveTask.package_name == '',
+            )
+        )).all())
         result = []
-        for message_id in sorted(set(request.message_ids)):
+        for message_id in ordered_ids:
             message = (
                 (await db.execute(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update()))
                 .scalars()
@@ -362,10 +398,24 @@ class TelegramArchiveService:
             if any(media.download_status not in {'ready', 'skipped'} for media in medias):
                 raise ServiceException(message=f'消息 {message_id} 的素材尚未全部下载完成')
             selected = [media for media in medias if media.download_status == 'ready']
+            if not selected:
+                raise ServiceException(message=f'消息 {message_id} 没有可归档的图片或视频')
+            filenames = message_media_filenames(message, medias)
             for media in selected:
                 if not media.local_path or not private_path(media.local_path).is_file():
                     raise ServiceException(message=f'消息 {message_id} 的本地素材缺失')
+                original = Path(filenames[media.media_id])
+                name, number = original.name, 1
+                while name in reserved and reserved[name] != media.media_id:
+                    tail = f'_{message.telegram_message_id}_{media.media_id}'
+                    if number > 1:
+                        tail += f'_{number}'
+                    name = f'{original.stem}{tail}{original.suffix}'
+                    number += 1
+                filenames[media.media_id] = name
+                reserved[name] = media.media_id
             manifest = {
+                'layout': 'flat-media-v1',
                 'text': message.message_text or '',
                 'source_chat_id': message.source_chat_id,
                 'source_chat_title': message.source_chat_title,
@@ -376,7 +426,7 @@ class TelegramArchiveService:
                 'files': [
                     {
                         'media_id': media.media_id,
-                        'name': Path(media.local_path).name,
+                        'name': filenames[media.media_id],
                         'original_name': media.file_name,
                         'mime_type': media.mime_type,
                         'size': media.file_size,
@@ -405,16 +455,13 @@ class TelegramArchiveService:
             if existing:
                 result.append(existing.task_id)
                 continue
-            source_label = re.sub(r'[^a-zA-Z0-9_-]', '_', message.source_chat_id)
-            date_label = (message.sent_at or message.create_time or datetime.now()).strftime('%Y-%m-%d')
-            package = f'{date_label}_{source_label}_{message.telegram_message_id}_{fingerprint[:8]}'
             task = TgArchiveTask(
                 dedupe_key=dedupe_key,
                 message_id=message_id,
                 media_revision=message.media_revision,
                 storage_id=request.storage_id,
                 target_path=target_path,
-                package_name=package,
+                package_name='',
                 manifest_json=manifest_json,
                 status='queued',
                 create_by=username,
@@ -429,16 +476,6 @@ class TelegramArchiveService:
                         file_name=file['name'],
                         file_size=file['size'],
                         sha256=file['sha256'],
-                        status='queued',
-                    )
-                )
-            for name, content in manifest_files(manifest).items():
-                db.add(
-                    TgArchiveItem(
-                        task_id=task.task_id,
-                        file_name=name,
-                        file_size=len(content),
-                        sha256=hashlib.sha256(content).hexdigest(),
                         status='queued',
                     )
                 )

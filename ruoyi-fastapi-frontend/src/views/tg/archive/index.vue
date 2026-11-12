@@ -1,11 +1,11 @@
 <template>
   <div class="app-container archive-library">
     <div class="library-heading">
-      <div><h2>素材库</h2><p>自动收集群消息，在这里整理并归档图片、视频和原文。</p></div>
+      <div><h2>素材库</h2><p>自动收集群消息，保留原文，整理并归档图片和视频。</p></div>
       <div class="library-actions" v-hasPermi="['tg:archive:write']">
         <el-button v-if="quarkStorages.length" @click="openQuark">夸克账号</el-button>
         <el-button type="danger" plain :disabled="!selected.length" :loading="cleaning" @click="cleanupLocal(selected)">清理所选本地素材</el-button>
-        <el-button type="primary" :disabled="!selected.length || selected.some(row => row.downloadState !== 'ready')" @click="openArchive(selected)">归档所选 {{ selected.length || '' }}</el-button>
+        <el-button type="primary" :disabled="!selected.length || selected.some(row => row.downloadState !== 'ready' || !row.readyCount)" @click="openArchive(selected)">归档所选 {{ selected.length || '' }}</el-button>
       </div>
     </div>
     <el-form :inline="true" @submit.prevent="search">
@@ -35,7 +35,7 @@
       <el-table-column label="消息时间" width="180"><template #default="{ row }">{{ parseTime(row.sentAt || row.createTime) }}</template></el-table-column>
       <el-table-column label="操作" width="290"><template #default="{ row }">
         <el-button link type="primary" @click="openDetail(row)">查看</el-button>
-        <el-button v-hasPermi="['tg:archive:write']" link type="primary" :disabled="row.downloadState !== 'ready'" @click="openArchive([row])">归档</el-button>
+        <el-button v-hasPermi="['tg:archive:write']" link type="primary" :disabled="row.downloadState !== 'ready' || !row.readyCount" @click="openArchive([row])">归档</el-button>
         <el-button v-if="['failed', 'deleted'].includes(row.downloadState)" v-hasPermi="['tg:archive:write']" link type="warning" @click="retryDownload(row.messageId)">{{ row.downloadState === 'deleted' ? '重新下载' : '重试' }}</el-button>
         <el-button v-hasPermi="['tg:archive:write']" link type="danger" :disabled="cleaning || !row.mediaCount" @click="cleanupLocal([row])">清理本地</el-button>
       </template></el-table-column>
@@ -95,9 +95,9 @@
     </el-dialog>
 
     <el-dialog v-model="archiveOpen" title="归档素材" width="620px" :close-on-click-modal="false">
-      <p>将 {{ archiveIds.length }} 条消息的原文和全部已采集素材上传，每条消息会放入独立子目录。</p>
+      <p>将 {{ archiveIds.length }} 条消息的图片和视频按消息从早到晚直接上传到所选目录，文件以消息文字命名。原文保留在素材库中。</p>
       <el-form label-position="top">
-        <el-form-item label="存储位置"><el-select v-model="archiveForm.storageId" :disabled="preparingArchive || creatingFolder || submitting" placeholder="选择夸克或 S3" style="width:100%" @change="changeStorage">
+        <el-form-item label="存储位置"><el-select v-model="archiveForm.storageId" :disabled="preparingArchive || creatingFolder || submitting || foldersLoading" placeholder="选择夸克或 S3" style="width:100%" @change="changeStorage">
           <el-option v-for="storage in storageOptions" :key="storage.id" :label="`${storage.name} · ${storage.type === 'quark' ? '夸克' : 'S3'}`" :value="storage.id" />
         </el-select></el-form-item>
       </el-form>
@@ -140,7 +140,7 @@ const filters = [
   { value: 'archived', label: '已归档' }, { value: 'blocked', label: '已拦截' },
 ];
 const labels = { deleted: '本地已清理', deleting: '清理中 / 待重试', ready: '已就绪', pending: '下载中 / 等待', failed: '失败', blocked: '已拦截', queued: '排队中', downloading: '下载中', retry: '等待重试', skipped: '非图片或视频', completed: '已完成', uploading: '上传中', disabled: '未开启' };
-const detailReady = computed(() => detail.value && detail.value.isSensitive !== 'Y' && detail.value.medias.every(m => ['ready', 'skipped'].includes(m.downloadStatus)));
+const detailReady = computed(() => detail.value && detail.value.isSensitive !== 'Y' && detail.value.medias.some(m => m.downloadStatus === 'ready') && detail.value.medias.every(m => ['ready', 'skipped'].includes(m.downloadStatus)));
 const label = value => labels[value] || value;
 const tagType = value => ['ready', 'completed'].includes(value) ? 'success' : value === 'failed' ? 'danger' : ['blocked', 'retry'].includes(value) ? 'warning' : 'info';
 const storageName = id => storageOptions.value.find(item => item.id === id)?.name || id;
@@ -253,7 +253,24 @@ async function openArchive(messages) {
   } catch (error) { folderError.value = error.message || '存储位置读取失败'; }
   finally { preparingArchive.value = false; }
 }
-async function changeStorage() { folderPath.value = ''; folderOptions.value = []; newFolderOpen.value = false; folderError.value = ''; if (archiveForm.storageId) await browse(''); }
+async function changeStorage() {
+  folderPath.value = ''; folderOptions.value = []; newFolderOpen.value = false; folderError.value = '';
+  const storageId = archiveForm.storageId;
+  if (!storageId) return;
+  foldersLoading.value = true;
+  try {
+    let path = '';
+    if (storageOptions.value.find(item => item.id === storageId)?.type === 'quark') {
+      const now = new Date();
+      const date = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+      await archiveApi.createFolder({ storageId, parentPath: '', name: '飞机' });
+      const result = await archiveApi.createFolder({ storageId, parentPath: '飞机', name: date });
+      path = result.data.path;
+    }
+    await browse(path);
+  } catch (error) { folderError.value = error.message || '默认归档目录准备失败'; }
+  finally { foldersLoading.value = false; }
+}
 async function browse(path) {
   const sequence = ++folderSequence;
   foldersLoading.value = true; folderError.value = '';

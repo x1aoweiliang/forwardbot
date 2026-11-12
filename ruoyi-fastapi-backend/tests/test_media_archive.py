@@ -33,7 +33,7 @@ from module_telegram.entity.do.telegram_do import (
 )
 from module_telegram.entity.vo.archive_vo import ArchiveLibraryQuery, ArchiveSubmitModel
 from module_telegram.entity.vo.telegram_vo import TgListenerRuleModel
-from module_telegram.service.archive_service import TelegramArchiveService, private_path
+from module_telegram.service.archive_service import TelegramArchiveService, media_filename, private_path
 from module_telegram.service.archive_storage import (
     ArchiveStorageError,
     QuarkArchiveStorage,
@@ -311,6 +311,7 @@ def test_download_resumes_partial_file_and_only_marks_complete_after_verificatio
             async with sessions() as db:
                 media = await db.get(TgMessageMedia, job['media_id'])
                 assert media.download_status == 'ready'
+                assert Path(media.local_path).name == '原文.jpg'
                 assert private_path(media.local_path).read_bytes() == b'abcdef'
                 assert media.sha256 == hashlib.sha256(b'abcdef').hexdigest()
                 assert not partial.exists()
@@ -350,14 +351,14 @@ def test_archive_is_idempotent_and_retry_skips_completed_files(monkeypatch: pyte
 
     class Storage:
         def ensure_dir(self, path: str) -> str:
-            assert path.startswith('旅行/')
+            assert path == '旅行'
             return path
 
         def upload(self, source: Path, directory: str, filename: str, checksum: str) -> str:
             nonlocal failed_once
             uploads.append(filename)
             assert hashlib.sha256(source.read_bytes()).hexdigest() == checksum
-            if filename == 'metadata.json' and not failed_once:
+            if filename == '原文_02.jpg' and not failed_once:
                 failed_once = True
                 raise ArchiveStorageError('网络中断')
             return f'remote/{filename}'
@@ -366,7 +367,7 @@ def test_archive_is_idempotent_and_retry_skips_completed_files(monkeypatch: pyte
         async with database(monkeypatch, tmp_path) as sessions:
             monkeypatch.setattr('module_telegram.service.archive_worker.get_storage', lambda _id: Storage())
             async with sessions() as db:
-                message_id = await ingest(db, [source_message()])
+                message_id = await ingest(db, [source_message(10, grouped_id=777), source_message(11, '', 777)])
                 request = ArchiveSubmitModel(message_ids=[message_id], storage_id='test', target_path='旅行')
                 with pytest.raises(ServiceException) as error:
                     await TelegramArchiveService.submit(db, request, 'operator')
@@ -387,7 +388,7 @@ def test_archive_is_idempotent_and_retry_skips_completed_files(monkeypatch: pyte
                     await db.scalar(
                         select(func.count()).select_from(TgArchiveItem).where(TgArchiveItem.status == 'completed')
                     )
-                    == 2
+                    == 1
                 )
                 await TelegramArchiveService.retry_archive(db, ids[0])
             await worker.archive(await worker.claim('archive'))
@@ -397,9 +398,96 @@ def test_archive_is_idempotent_and_retry_skips_completed_files(monkeypatch: pyte
                     'total'
                 ] == 1
                 assert (await TelegramArchiveService.detail(db, message_id))['archives'][0]['files']
-            assert uploads.count('10.jpg') == 1
-            assert uploads.count('message.txt') == 1
-            assert uploads.count('metadata.json') == 2
+            assert uploads == ['原文_01.jpg', '原文_02.jpg', '原文_02.jpg']
+            assert not private_path('.tasks').exists()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(('text', 'sequence', 'expected'), [
+    ('第二集', None, '第二集.mp4'),
+    ('第一集.mp4', None, '第一集.mp4'),
+    ('  ', None, '986.mp4'),
+    ('第/一集\n预告', 2, '第_一集 预告_02.mp4'),
+])
+def test_media_filename_uses_caption_and_safe_album_index(text: str, sequence: int | None, expected: str) -> None:
+    assert media_filename(986, 'video/mp4', text, sequence) == expected
+    assert len(media_filename(986, 'video/mp4', '第' * 500, 1).encode()) < 200
+
+
+def test_batch_archives_in_source_order_and_reserves_distinct_flat_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            # Ingest order differs from source order; selection order is deliberately reversed.
+            last = await ingest(db, [source_message(30, '第二集')])
+            first = await ingest(db, [source_message(10, '第一集')])
+            second = await ingest(db, [source_message(20, '第一集')])
+            for message_id in [last, first, second]:
+                await ready_media(db, message_id)
+            request = ArchiveSubmitModel(message_ids=[last, second, first], storage_id='test', target_path='剧集')
+            ids = await TelegramArchiveService.submit(db, request, 'test')
+            tasks = list(await db.scalars(select(TgArchiveTask).order_by(TgArchiveTask.task_id)))
+            assert [task.message_id for task in tasks] == [first, second, last]
+            assert all(task.package_name == '' and task.target_path == '剧集' for task in tasks)
+            items = list(await db.scalars(select(TgArchiveItem).order_by(TgArchiveItem.item_id)))
+            assert len(items) == 3 and all(item.media_id is not None for item in items)
+            names = [item.file_name for item in items]
+            assert names[0] == '第一集.jpg' and names[2] == '第二集.jpg'
+            assert names[1].startswith('第一集_20_') and len(set(names)) == 3
+            assert await TelegramArchiveService.submit(db, request, 'test') == ids
+            worker = TelegramArchiveWorker()
+            for expected in [first, second, last]:
+                job = await worker.claim('archive')
+                assert job['message_id'] == expected
+                await worker._update('archive', job, status='completed')
+
+    asyncio.run(run())
+
+
+def test_text_only_message_does_not_create_an_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            text = source_message()
+            text.media = text.photo = None
+            message_id = await ingest(db, [text])
+            with pytest.raises(ServiceException) as error:
+                await TelegramArchiveService.submit(db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test')
+            assert '没有可归档' in error.value.message
+            assert await db.scalar(select(func.count()).select_from(TgArchiveTask)) == 0
+
+    asyncio.run(run())
+
+
+def test_existing_media_rename_preserves_partial_files_preview_and_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from rename_archive_media import migrate
+
+    async def run() -> None:
+        async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
+            message_id = await ingest(db, [source_message(10, '第一集', 777), source_message(11, '', 777)])
+            await ready_media(db, message_id)
+            pending = await ingest(db, [source_message(20, '第二集')])
+            partial = private_path(f'tg/1/{pending}/20.jpg.part')
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b'abc')
+            assert await migrate(db) == {'planned': 2, 'unchanged': 0}
+            assert private_path(f'tg/1/{message_id}/10.jpg').exists()
+            journal = tmp_path / 'rename.json'
+            assert await migrate(db, apply=True, backup=journal) == {'renamed': 2, 'unchanged': 0}
+            files = list(await db.scalars(select(TgMessageMedia).where(TgMessageMedia.message_id == message_id).order_by(TgMessageMedia.media_id)))
+            assert [Path(media.local_path).name for media in files] == ['第一集_01.jpg', '第一集_02.jpg']
+            for media in files:
+                path, mime = await TelegramArchiveService.media_file(db, media.media_id)
+                assert path.read_bytes() == b'abcdef' and mime == 'image/jpeg'
+            assert partial.read_bytes() == b'abc'
+            assert await migrate(db) == {'planned': 0, 'unchanged': 2}
+            assert len(json.loads(journal.read_text())) == 2
+            assert (await TelegramArchiveService.cleanup_local(db, [message_id]))['freedBytes'] == 12
+            assert not private_path(f'tg/1/{message_id}/第一集_01.jpg').exists()
+            assert partial.exists()
 
     asyncio.run(run())
 

@@ -38,7 +38,21 @@ class ForwardClient:
 
     async def send_file(self, target: int, files: list[Any], caption: str) -> Any:
         local = isinstance(files[0], str)
-        ids = tuple(int(Path(item).stem) if local else item.id for item in files)
+        if local and not all(Path(item).stem.isdecimal() for item in files):
+            from config.database import AsyncSessionLocal
+            from module_telegram.service.telegram_rule_service import TelegramStorageService
+
+            async with AsyncSessionLocal() as db:
+                stored = {
+                    (TelegramStorageService.for_media(row).base_dir / row.local_path).resolve(): row.source_telegram_message_id
+                    for row in await db.scalars(select(TgMessageMedia)) if row.local_path
+                }
+            ids = tuple(stored[Path(item).resolve()] for item in files)
+        elif local:
+            # Legacy/cache fixtures still encode source IDs in their synthetic filenames.
+            ids = tuple(int(Path(item).stem) for item in files)
+        else:
+            ids = tuple(item.id for item in files)
         self.calls.append((target, ids, local))
         if not local and target in self.reject_sources:
             raise RuntimeError('source media expired')

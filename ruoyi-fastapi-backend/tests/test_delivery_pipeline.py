@@ -384,7 +384,7 @@ def test_cancelled_upload_keeps_ownership_until_real_operation_exits(
                 async with sessions() as db:
                     with pytest.raises(ServiceException):
                         await TelegramArchiveService.cleanup_local(db, [message_id])
-                assert uploads == ['10.jpg']
+                assert uploads == ['原文.jpg']
             finally:
                 release.set()
                 await asyncio.gather(sending, return_exceptions=True)
