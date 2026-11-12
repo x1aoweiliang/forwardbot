@@ -30,7 +30,6 @@
       <el-table-column label="ID" prop="accountId" width="80" />
       <el-table-column label="账号名称" prop="accountName" />
       <el-table-column label="手机号" prop="phone" />
-      <el-table-column label="API ID" prop="apiId" width="120" />
       <el-table-column label="登录状态" width="130"><template #default="scope">{{ optionLabel(sessionStatusOptions, scope.row.sessionStatus) }}</template></el-table-column>
       <el-table-column label="启停" prop="status" width="90">
         <template #default="scope">
@@ -56,8 +55,6 @@
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="账号名称" prop="accountName"><el-input v-model="form.accountName" /></el-form-item>
         <el-form-item label="手机号" prop="phone"><el-input v-model="form.phone" /></el-form-item>
-        <el-form-item label="API ID" prop="apiId"><el-input-number v-model="form.apiId" :min="1" style="width: 100%" /></el-form-item>
-        <el-form-item label="API Hash" prop="apiHash"><el-input v-model="form.apiHash" type="password" show-password /></el-form-item>
         <el-form-item label="状态" prop="status">
           <el-radio-group v-model="form.status"><el-radio label="0">启用</el-radio><el-radio label="1">停用</el-radio></el-radio-group>
         </el-form-item>
@@ -107,8 +104,6 @@ const data = reactive({
   rules: {
     accountName: [{ required: true, message: "账号名称不能为空", trigger: "blur" }],
     phone: [{ required: true, message: "手机号不能为空", trigger: "blur" }],
-    apiId: [{ required: true, message: "API ID不能为空", trigger: "blur" }],
-    apiHash: [{ required: true, message: "API Hash不能为空", trigger: "blur" }],
   },
 });
 const { queryParams, form, loginForm, rules } = toRefs(data);
@@ -125,7 +120,7 @@ function getList() {
   });
 }
 function reset() {
-  form.value = { accountId: undefined, accountName: undefined, phone: undefined, apiId: undefined, apiHash: undefined, status: "0" };
+  form.value = { accountId: undefined, accountName: undefined, phone: undefined, status: "0" };
   proxy.resetForm("formRef");
 }
 function handleQuery() {
@@ -148,7 +143,7 @@ function handleAdd() {
 }
 function handleUpdate(row) {
   reset();
-  form.value = { ...row, apiHash: row.apiHash || "********" };
+  form.value = { ...row };
   open.value = true;
   title.value = "修改Telegram账号";
 }

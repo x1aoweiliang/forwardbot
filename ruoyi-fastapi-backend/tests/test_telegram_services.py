@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from config.env import TelegramConfig
 from module_telegram.entity.do.telegram_do import TgAccount
 from module_telegram.entity.vo.telegram_vo import TgChatSendMessageModel
 from module_telegram.service.telegram_client_service import TelegramClientManager
@@ -73,7 +74,7 @@ def test_sensitive_word_matcher_respects_per_word_match_case() -> None:
     assert matcher.match('这是诈骗内容').hit_word == '诈骗'
 
 
-def test_account_detail_sanitizer_hides_api_hash_and_session_path() -> None:
+def test_account_detail_sanitizer_hides_session_path_and_api_fields() -> None:
     account = TgAccount(
         account_name='test',
         phone='+10000000000',
@@ -84,8 +85,36 @@ def test_account_detail_sanitizer_hides_api_hash_and_session_path() -> None:
 
     sanitized = TelegramCrudService.sanitize_account_result(account)
 
-    assert sanitized.api_hash == '********'
+    assert not hasattr(sanitized, 'api_id')
+    assert not hasattr(sanitized, 'api_hash')
     assert sanitized.session_path is None
+
+
+def test_telegram_client_uses_environment_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def run_case() -> None:
+        captured = {}
+        configured_id = 987654
+
+        class FakeClient:
+            def __init__(self, session_path: str, api_id: int, api_hash: str, **kwargs: object) -> None:
+                captured.update(session_path=session_path, api_id=api_id, api_hash=api_hash, kwargs=kwargs)
+
+            async def connect(self) -> None:
+                return None
+
+        monkeypatch.setattr('module_telegram.service.telegram_client_service.TelegramClient', FakeClient)
+        monkeypatch.setattr(TelegramConfig, 'telegram_api_id', configured_id)
+        monkeypatch.setattr(TelegramConfig, 'telegram_api_hash', 'configured-hash')
+        monkeypatch.setattr(TelegramClientManager, '_session_dir', tmp_path / 'sessions')
+        monkeypatch.setattr(TelegramClientManager, '_clients', {})
+        await TelegramClientManager.get_client(
+            SimpleNamespace(account_id=1, session_path=None, api_id=1, api_hash='legacy-hash')
+        )
+
+        assert captured['api_id'] == configured_id
+        assert captured['api_hash'] == 'configured-hash'
+
+    asyncio.run(run_case())
 
 
 def test_ad_text_policy_allows_ad_templates_to_be_assigned_independently() -> None:

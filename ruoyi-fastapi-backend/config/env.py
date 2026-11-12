@@ -54,6 +54,13 @@ class ArchiveSettings(BaseSettings):
     archive_lease_seconds: int = 180
 
 
+class TelegramSettings(BaseSettings):
+    """Telegram应用级API凭据。"""
+
+    telegram_api_id: int | None = None
+    telegram_api_hash: str | None = None
+
+
 class DataBaseSettings(BaseSettings):
     """
     数据库配置
@@ -251,6 +258,10 @@ class GetConfig:
         # 实例化Jwt配置模型
         return JwtSettings()
 
+    def get_telegram_config(self) -> TelegramSettings:
+        """获取Telegram应用级配置。"""
+        return TelegramSettings()
+
     def get_database_config(self) -> DataBaseSettings:
         """
         获取数据库配置
@@ -333,6 +344,8 @@ get_config = GetConfig()
 AppConfig = get_config.get_app_config()
 # Jwt配置
 JwtConfig = get_config.get_jwt_config()
+# Telegram应用级API配置
+TelegramConfig = get_config.get_telegram_config()
 # 数据库配置
 DataBaseConfig = get_config.get_database_config()
 # Redis配置

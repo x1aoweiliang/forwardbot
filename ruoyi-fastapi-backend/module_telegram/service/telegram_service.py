@@ -69,8 +69,6 @@ class TelegramCrudService:
     @staticmethod
     def sanitize_account_result(row: Any) -> TgAccountModel:
         result = TelegramCrudService._result_model(row, TgAccountModel)
-        if result.api_hash:
-            result.api_hash = '********'
         result.session_path = None
         result.login_code_hash = None
         return result
@@ -85,8 +83,8 @@ class TelegramCrudService:
         result = await TelegramDao.list_items(db, TgAccount, query, filters, TgAccount.account_id.desc(), is_page)
         rows = result.rows if isinstance(result, PageModel) else result
         for row in rows:
-            if 'apiHash' in row:
-                row['apiHash'] = '********'
+            row.pop('apiId', None)
+            row.pop('apiHash', None)
             if 'sessionPath' in row:
                 row['sessionPath'] = None
             if 'loginCodeHash' in row:
@@ -100,6 +98,8 @@ class TelegramCrudService:
     @classmethod
     async def add_account(cls, db: AsyncSession, item: TgAccountModel) -> CrudResponseModel:
         data = cls._clean_payload(item)
+        api_id, api_hash = TelegramClientManager.api_credentials()
+        data.update(api_id=api_id, api_hash=api_hash)
         data.setdefault('session_status', 'logged_out')
         try:
             await TelegramDao.add_item(db, TgAccount, data)
@@ -114,8 +114,6 @@ class TelegramCrudService:
         data = cls._clean_payload(item)
         if not data.get('account_id'):
             raise ServiceException(message='账号ID不能为空')
-        if data.get('api_hash') == '********':
-            del data['api_hash']
         data['update_time'] = datetime.now()
         try:
             await TelegramDao.update_item(db, TgAccount, data)

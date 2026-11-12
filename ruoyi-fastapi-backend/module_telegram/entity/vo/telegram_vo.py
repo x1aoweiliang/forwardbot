@@ -13,8 +13,6 @@ class TgAccountModel(TelegramBaseModel):
     account_id: int | None = Field(default=None, description='账号主键')
     account_name: str | None = Field(default=None, description='账号名称')
     phone: str | None = Field(default=None, description='手机号')
-    api_id: int | None = Field(default=None, description='Telegram API ID')
-    api_hash: str | None = Field(default=None, description='Telegram API Hash')
     session_path: str | None = Field(default=None, description='Session文件路径')
     session_status: str | None = Field(default='logged_out', description='Session状态')
     login_code_hash: str | None = Field(default=None, description='登录验证码Hash')

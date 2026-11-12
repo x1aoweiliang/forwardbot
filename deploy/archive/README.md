@@ -24,6 +24,15 @@ ARCHIVE_STORAGES_FILE=vf_admin/archive/storages.json
 
 `ARCHIVE_ENABLED=true` 启动下载、手动归档上传和补采后台任务。`false` 关闭这些任务，发送执行器仍然运行；它不会修改数据库中的监听规则，也不会删除已保存的文件。规则里的「自动下载图片、视频」决定哪些新消息进入采集队列，「自动转发」单独控制转发。只需转发的部署应关闭规则里的自动下载，避免一直积累待下载记录。
 
+Telegram 的应用凭据统一从当前环境文件读取：在 `.env.prod` 或 `.env.dev` 配置 `TELEGRAM_API_ID` 和 `TELEGRAM_API_HASH`。账号管理页面只填写账号名称和手机号，所有 Telegram 账号共用这组应用凭据；数据库中的历史字段仅为兼容旧表保留，运行时不再读取。
+
+```dotenv
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=填写你的API_Hash
+```
+
+替换为实际应用凭据后重启后端；使用 `.env.prod` 时通过 `python app.py --env=prod` 启动。未配置时新增账号和创建 Telegram 连接会提示补齐配置，配置值不会返回前端。新增账号仍写入旧表的必填凭据列以兼容表结构，修改配置后已有账号直接使用新值，无需逐个修改或执行数据库迁移。
+
 首次升级到此版本，需要在当前业务数据库上执行增量迁移，增加监听规则开关、素材状态和归档任务表。应用启动时的 `create_all` 不会给已有表补列；不要重新导入会重建基础表的完整初始化 SQL。
 
 已经安装媒体下载分支的部署也需停止后端后再次运行以下迁移，升级到 `20261112_01`：补齐发送记录的素材 ID、查询索引、租约、转发模式及发送阶段，并将此前未下载的非图片、视频附件恢复为转发缓存类型。迁移保留原数据及已有素材路径，不需要新建数据库或 Redis。
@@ -63,6 +72,8 @@ cp deploy/archive/storages.example.json deploy/archive/storages.json
 ```
 
 编辑 `.env`：给数据库、Redis、JWT 分别设置新的随机密钥。可以运行三次 `openssl rand -hex 32` 生成。按需修改 `ARCHIVE_HTTP_PORT`。
+
+同一文件填写 `TELEGRAM_API_ID` 和 `TELEGRAM_API_HASH`，Compose 会将它们传入后端。
 
 编辑 `storages.json`：只保留要使用的存储配置。尚未配置云端时可填 `[]`，先使用采集和本地预览。S3 密钥填写在 `.env` 中，不写入数据库或前端。以上实际配置文件已被 Git 忽略。
 

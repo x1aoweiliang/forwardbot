@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config.env import TelegramConfig
 from exceptions.exception import ServiceException
 from module_telegram.dao.telegram_dao import TelegramDao
 from module_telegram.entity.do.telegram_do import TgAccount
@@ -50,6 +51,14 @@ class TelegramClientManager:
         if TelegramClient is None:
             raise ServiceException(message='缺少telethon依赖，请先安装后重启服务')
 
+    @staticmethod
+    def api_credentials() -> tuple[int, str]:
+        api_id = TelegramConfig.telegram_api_id
+        api_hash = (TelegramConfig.telegram_api_hash or '').strip()
+        if not api_id or api_id <= 0 or not api_hash:
+            raise ServiceException(message='未配置Telegram API ID/API Hash，请在后端 .env 配置 TELEGRAM_API_ID 和 TELEGRAM_API_HASH')
+        return api_id, api_hash
+
     @classmethod
     def build_session_path(cls, account: TgAccount) -> Path:
         cls._session_dir.mkdir(parents=True, exist_ok=True)
@@ -67,8 +76,9 @@ class TelegramClientManager:
         cls._ensure_dependency()
         if account.account_id in cls._clients:
             return cls._clients[account.account_id]
+        api_id, api_hash = cls.api_credentials()
         session_path = account.session_path or str(cls.build_session_path(account))
-        client = TelegramClient(session_path, account.api_id, account.api_hash, sequential_updates=True)
+        client = TelegramClient(session_path, api_id, api_hash, sequential_updates=True)
         await client.connect()
         cls._clients[account.account_id] = client
         return client
