@@ -59,7 +59,7 @@ def message_media_filenames(message: TgMessage, medias: list[TgMessageMedia]) ->
         media.media_id: media_filename(
             media.source_telegram_message_id, media.mime_type,
             (media.caption or '').strip() or message.message_text,
-            index if len(files) > 1 or message.grouped_id else None,
+            index if len(files) > 1 else None,
         )
         for index, media in enumerate(files, 1)
     }
