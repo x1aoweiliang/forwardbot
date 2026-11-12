@@ -121,6 +121,14 @@ async def ingest(db: Any, messages: list[Any]) -> int:
     return message_id
 
 
+async def ingest_and_dispatch(db: Any, messages: list[Any]) -> int:
+    """Simulate the independent consumer only after the ingest transaction commits."""
+    message_id = await ingest(db, messages)
+    await TelegramArchiveWorker().deliver_pending()
+    db.expire_all()
+    return message_id
+
+
 async def ready_media(db: Any, message_id: int) -> None:
     medias = (await db.execute(select(TgMessageMedia).where(TgMessageMedia.message_id == message_id))).scalars().all()
     for media in medias:
@@ -620,8 +628,9 @@ def test_independent_transport_keys_persist_without_replacing_other_deployment(
     assert path.read_bytes() == first
 
 
+@pytest.mark.parametrize('archive_enabled', [True, False])
 def test_archive_worker_starts_after_restart_with_stale_logging_lock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, archive_enabled: bool,
 ) -> None:
     from unittest.mock import AsyncMock, Mock
 
@@ -630,7 +639,8 @@ def test_archive_worker_starts_after_restart_with_stale_logging_lock(
     async def run() -> None:
         async with database(monkeypatch, tmp_path) as sessions:
             restore, start = AsyncMock(), Mock()
-            monkeypatch.setattr(ArchiveConfig, 'archive_enabled', True)
+            monkeypatch.setattr(ArchiveConfig, 'archive_enabled', archive_enabled)
+            monkeypatch.setattr(server.AppConfig, 'app_workers', 1)
             monkeypatch.setattr(server, 'AsyncSessionLocal', sessions)
             monkeypatch.setattr(server.SchedulerUtil, 'init_system_scheduler', AsyncMock())
             monkeypatch.setattr(server.LogAggregatorService, 'consume_stream', AsyncMock())
@@ -819,7 +829,8 @@ def test_revoked_download_cannot_recreate_cleaned_files(monkeypatch: pytest.Monk
                         db.add(TgSensitiveWord(word='spam', match_case='N'))
                         await db.commit()
                         await ingest(db, [source_message(9, 'spam', 777)])
-                        await TelegramArchiveService.cleanup_local(db, [message_id])
+                        with pytest.raises(ServiceException):
+                            await TelegramArchiveService.cleanup_local(db, [message_id])
                     return source_message(10, grouped_id=777)
 
                 def iter_download(self, *_args: Any, **_kwargs: Any) -> None:
@@ -831,6 +842,8 @@ def test_revoked_download_cannot_recreate_cleaned_files(monkeypatch: pytest.Monk
             monkeypatch.setattr(TelegramClientManager, 'get_authorized_client', client)
             with pytest.raises(asyncio.CancelledError):
                 await worker.download(job)
+            async with sessions() as db:
+                await TelegramArchiveService.cleanup_local(db, [message_id])
             assert not private_path(f'tg/1/{message_id}/10.jpg.part').exists()
             async with sessions() as db:
                 assert set(await db.scalars(select(TgMessageMedia.download_status))) == {'deleted'}

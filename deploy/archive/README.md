@@ -22,18 +22,22 @@ ARCHIVE_MEDIA_DIR=vf_admin/archive/media
 ARCHIVE_STORAGES_FILE=vf_admin/archive/storages.json
 ```
 
-`ARCHIVE_ENABLED=true` 启动下载、手动归档上传和补采后台任务。`false` 关闭这些任务，保留原有转发功能；它不会修改数据库中的监听规则，也不会删除已保存的文件。规则里的「自动下载图片、视频」决定哪些新消息进入采集队列，「自动转发」单独控制转发。只需转发的部署应关闭规则里的自动下载，避免一直积累待下载记录。
+`ARCHIVE_ENABLED=true` 启动下载、手动归档上传和补采后台任务。`false` 关闭这些任务，发送执行器仍然运行；它不会修改数据库中的监听规则，也不会删除已保存的文件。规则里的「自动下载图片、视频」决定哪些新消息进入采集队列，「自动转发」单独控制转发。只需转发的部署应关闭规则里的自动下载，避免一直积累待下载记录。
 
 首次升级到此版本，需要在当前业务数据库上执行增量迁移，增加监听规则开关、素材状态和归档任务表。应用启动时的 `create_all` 不会给已有表补列；不要重新导入会重建基础表的完整初始化 SQL。
 
-已经安装媒体下载分支的部署也需再次运行以下迁移，应用 `20261111_02`：为发送记录增加本次素材 ID 列及状态、消息查询索引。该迁移保留原数据，不需要新建数据库或 Redis。
+已经安装媒体下载分支的部署也需停止后端后再次运行以下迁移，升级到 `20261112_01`：补齐发送记录的素材 ID、查询索引、租约、转发模式及发送阶段，并将此前未下载的非图片、视频附件恢复为转发缓存类型。迁移保留原数据及已有素材路径，不需要新建数据库或 Redis。
 
 ```bash
 APP_ENV=dev ../.venv/bin/python -m alembic upgrade head
 ../.venv/bin/python app.py
 ```
 
-同时开启采集和自动转发时，如果 Telegram 媒体引用发送失败，发送记录会显示「等待下载后补发」。下载完成后后台使用本地文件补发对应目标，重启后继续处理待补发记录；下载失败或素材被清理时转为失败，可处理素材后手动转发。相册后续到达的素材单独补发，重复监听事件不会重发已保存的成员。后台补发遵守账号监听启停和当前转发规则。
+实时监听、补采和手动转发统一提交到发送队列，发送记录先显示「等待发送」。手动操作返回“已加入发送队列”，最终结果在发送记录中查看。自动转发执行前检查账号监听启停和当前规则，手动转发无需启动监听。
+
+同时开启采集和自动转发时，如果 Telegram 媒体引用发送失败，发送记录会显示「等待下载后补发」。下载完成后后台使用本地文件补发对应目标，重启后继续处理待补发记录；下载失败或素材被清理时转为失败，可处理素材后手动转发。相册后续到达的素材单独补发，重复监听事件不会重发已保存的成员。
+
+上传 Telegram 期间显示「发送中」，下载任务可继续运行；此时本地清理会提示等待发送结束。中断的发送在租约过期且旧操作退出后恢复。PDF、音频等未纳入采集的附件继续使用原来的转发缓存和下载回退，待发送的缓存不会被定时清理。停止服务会等待正在执行的阻塞上传结束或超时，避免遗留上传与重试同时执行。事务、任务和文件占用的完整约束见 [架构说明](architecture.md)。
 
 已有 PostgreSQL 后台还需执行仓库中的 `deploy/archive/menu.sql`，增加「素材库」菜单和归档权限；这个脚本不重复创建已有菜单。没有新增菜单时，前端不会显示素材库入口。
 
@@ -150,10 +154,10 @@ docker compose --env-file deploy/archive/.env -f compose.archive.yml logs -f bac
 
 ```bash
 cd ruoyi-fastapi-backend
-python -m pytest tests/test_telegram_services.py tests/test_media_archive.py tests/test_quark_archive.py -q
+python -m pytest tests/test_telegram_services.py tests/test_media_archive.py tests/test_quark_archive.py tests/test_media_archive_regressions.py tests/test_forward_leases.py tests/test_delivery_pipeline.py -q
 cd ../ruoyi-fastapi-frontend
 npm install
 npm run build:prod
 ```
 
-测试使用临时 SQLite 数据库与模拟云端，不访问生产数据库或发送 Telegram 消息。部署验收还应包含实际群里的图片、相册、大视频、重启恢复、夸克登录和上传，以及 S3 上传。未提供真实账号或存储凭据时，这些外部链路不能由本地测试替代。
+测试使用临时数据库与模拟云端，不访问生产数据库或发送 Telegram 消息。锁并发测试需要 PATH 中有 PostgreSQL 的 `initdb` 和 `pg_ctl`，会通过私有 Unix socket 启动临时实例，用完自动关闭；缺少这些命令时跳过该测试。部署验收还应包含实际群里的图片、相册、大视频、重启恢复、夸克登录和上传，以及 S3 上传。未提供真实账号或存储凭据时，这些外部链路不能由本地测试替代。

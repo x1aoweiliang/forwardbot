@@ -1,7 +1,8 @@
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -39,6 +40,7 @@ from module_telegram.entity.vo.telegram_vo import (
     TgSensitiveWordModel,
     TgSensitiveWordPageQueryModel,
 )
+from module_telegram.service.media_runtime import media_runtime, run_blocking
 from module_telegram.service.telegram_client_service import TelegramClientManager
 from module_telegram.service.telegram_rule_service import (
     ContentCleanPolicy,
@@ -476,378 +478,178 @@ class TelegramCrudService:
         if not account:
             raise ServiceException(message='发送账号不存在')
         try:
-            if getattr(item, 'forward_mode', 'native_hidden') == 'native_hidden':
-                results = await TelegramForwardService.forward_native_hidden_to_chats(db, account, message, target_chats, 'manual')
-            else:
-                results = await TelegramForwardService.forward_to_chats(db, account, message, target_chats, 'manual')
+            medias = await TelegramDao.get_media_by_message_id(db, message.message_id)
+            await TelegramForwardService.enqueue(
+                db, account, message, target_chats, 'manual',
+                TelegramForwardService._source_message_ids(message, medias), item.forward_mode or 'native_hidden',
+            )
             await db.commit()
-            success_count = sum(1 for result in results if result.status == 'success')
-            return CrudResponseModel(is_success=True, message=f'手动转发完成，成功{success_count}个')
-        except Exception as exc:
+            return CrudResponseModel(is_success=True, message=f'已加入发送队列，共{len(target_chats)}个目标，请在发送记录查看结果')
+        except Exception:
             await db.rollback()
-            raise exc
+            raise
 
 
 class TelegramForwardService:
-    """
-    Telegram转发服务。
-    """
+    """Transactional outbox: prepare under lock, perform I/O detached, finish fenced."""
+
+    @staticmethod
+    def _source_message_ids(message: Any, medias: list[Any]) -> list[int]:
+        return [media.source_telegram_message_id for media in medias] if medias else [message.telegram_message_id]
 
     @classmethod
-    async def _load_source_media_messages(cls, client: Any, message: TgMessage, medias: list[Any]) -> list[Any]:
-        source_ids = [media.source_telegram_message_id for media in medias if getattr(media, 'source_telegram_message_id', None)]
-        if not source_ids:
-            return []
-        try:
-            loaded_messages = await client.get_messages(message.source_chat_id, ids=source_ids)
-        except Exception:
-            return []
-        if not isinstance(loaded_messages, list) and hasattr(loaded_messages, '__iter__') and not isinstance(loaded_messages, str):
-            loaded_messages = list(loaded_messages)
-        elif not isinstance(loaded_messages, list):
-            loaded_messages = [loaded_messages] if loaded_messages else []
-        loaded_by_id = {getattr(item, 'id', None): item for item in loaded_messages if item}
-        return [loaded_by_id[source_id] for source_id in source_ids if source_id in loaded_by_id]
-
-    @classmethod
-    def _media_unavailable_results(cls, message_id: int, target_chat_ids: list[str], forward_type: str) -> list[ForwardDispatchResult]:
-        return [
-            ForwardDispatchResult(
-                message_id=message_id,
-                target_chat_id=target_chat_id,
-                forward_type=forward_type,
-                status='failed',
-                error_message='媒体文件不可用',
-            )
-            for target_chat_id in target_chat_ids
-        ]
-
-    @classmethod
-    def _source_messages_by_id(cls, source_messages: list[Any]) -> dict[int, Any]:
-        return {
-            source_message_id: source_message
-            for source_message in source_messages
-            if (source_message_id := getattr(source_message, 'id', None)) is not None
-        }
-
-    @classmethod
-    def _complete_source_media_messages(cls, medias: list[Any], source_messages: list[Any]) -> list[Any]:
-        source_by_id = cls._source_messages_by_id(source_messages)
-        ordered_messages = []
-        for media in medias:
-            source_message_id = getattr(media, 'source_telegram_message_id', None)
-            if source_message_id is None or source_message_id not in source_by_id:
-                return []
-            ordered_messages.append(source_by_id[source_message_id])
-        return ordered_messages
-
-    @classmethod
-    def _source_message_ids(cls, message: TgMessage, medias: list[Any]) -> list[int]:
-        if medias:
-            source_ids = [
-                getattr(media, 'source_telegram_message_id', None)
-                for media in sorted(medias, key=lambda item: getattr(item, 'media_index', 0) or 0)
-            ]
-            return source_ids if all(source_id is not None for source_id in source_ids) else []
-        telegram_message_id = getattr(message, 'telegram_message_id', None)
-        return [telegram_message_id] if telegram_message_id is not None else []
-
-    @classmethod
-    async def _forward_native_hidden_to_chat(
-        cls,
-        client: Any,
-        message: TgMessage,
-        target_chat: TgChat,
-        source_message_ids: list[int],
-        forward_type: str,
-    ) -> ForwardDispatchResult:
-        try:
-            if not source_message_ids:
-                raise RuntimeError('源消息不可用')
-            sent_message = await client.forward_messages(
-                ForwardDispatcher._normalize_target_chat(target_chat.chat_id),
-                source_message_ids,
-                from_peer=ForwardDispatcher._normalize_target_chat(message.source_chat_id),
-                drop_author=True,
-                drop_media_captions=False,
-            )
-            if isinstance(sent_message, list):
-                sent_message_id = getattr(sent_message[0], 'id', None) if sent_message else None
-            else:
-                sent_message_id = getattr(sent_message, 'id', None)
-            return ForwardDispatchResult(
-                message_id=message.message_id,
-                target_chat_id=target_chat.chat_id,
-                forward_type=forward_type,
-                status='success',
-                sent_telegram_message_id=sent_message_id,
-            )
-        except Exception as exc:
-            return ForwardDispatchResult(
-                message_id=message.message_id,
-                target_chat_id=target_chat.chat_id,
-                forward_type=forward_type,
-                status='failed',
-                error_message=str(exc),
-            )
-
-    @classmethod
-    async def forward_native_hidden_to_chats(
-        cls,
-        db: AsyncSession,
-        account: TgAccount,
-        message: TgMessage,
-        target_chats: list[TgChat],
-        forward_type: str,
-        media_source_ids: list[int] | None = None,
-    ) -> list[ForwardDispatchResult]:
-        client = await TelegramClientManager.get_authorized_client(account)
-        medias = await TelegramDao.get_media_by_message_id(db, message.message_id)
-        source_message_ids = media_source_ids if media_source_ids is not None else cls._source_message_ids(message, medias)
-        results = [
-            await cls._forward_native_hidden_to_chat(client, message, target_chat, source_message_ids, forward_type)
-            for target_chat in target_chats
-        ]
-        await cls._persist_forward_results(db, account, message, target_chats, results, forward_type, source_message_ids)
-        return results
-
-    @classmethod
-    async def _persist_forward_results(
-        cls,
-        db: AsyncSession,
-        account: TgAccount,
-        message: TgMessage,
-        target_chats: list[TgChat],
-        results: list[ForwardDispatchResult],
-        forward_type: str,
-        source_message_ids: list[int] | None = None,
-        retry_record: TgForwardRecord | None = None,
+    async def enqueue(
+        cls, db: AsyncSession, account: Any, message: Any, targets: list[Any],
+        forward_type: str, source_ids: list[int], mode: str,
     ) -> None:
-        previous = await TelegramDao.get_auto_forward_records(db, message.message_id) if forward_type == 'auto' else []
-        statuses = [item.status for item in previous if retry_record is None or item.record_id != retry_record.record_id]
-        chat_map = {chat.chat_id: chat for chat in target_chats}
-        for result in results:
-            chat = chat_map.get(result.target_chat_id)
-            data = {
-                'message_id': message.message_id,
-                'account_id': account.account_id,
-                'target_chat_pk': chat.chat_pk if chat else None,
-                'target_chat_id': result.target_chat_id,
-                'target_chat_title': chat.chat_title if chat else None,
-                'forward_type': forward_type,
-                'source_message_ids': json.dumps(source_message_ids) if source_message_ids is not None else None,
-                'status': result.status,
-                'sent_telegram_message_id': result.sent_telegram_message_id,
-                'error_message': result.error_message,
-                'create_time': datetime.now(),
-            }
-            if retry_record is None:
-                await TelegramDao.add_forward_record(db, data)
-            else:
-                retry_record.status = result.status
-                retry_record.sent_telegram_message_id = result.sent_telegram_message_id
-                retry_record.error_message = result.error_message
-            statuses.append(result.status)
         if forward_type == 'auto':
-            await TelegramDao.update_message(
-                db,
-                {
-                    'message_id': message.message_id,
-                    'auto_forward_status': (
-                        'partial_failed' if any(status == 'failed' for status in statuses)
-                        else 'pending' if 'waiting_download' in statuses else 'success'
-                    ),
-                    'update_time': datetime.now(),
-                },
-            )
+            message.auto_forward_status = 'pending'
+        for target in targets:
+            await TelegramDao.add_forward_record(db, {
+                'message_id': message.message_id, 'account_id': account.account_id,
+                'target_chat_pk': target.chat_pk, 'target_chat_id': target.chat_id,
+                'target_chat_title': target.chat_title, 'forward_type': forward_type,
+                'source_message_ids': json.dumps(source_ids), 'forward_mode': mode, 'status': 'queued',
+            })
+
+    @staticmethod
+    def _copy(row: Any) -> Any:
+        return SimpleNamespace(**{column.name: getattr(row, column.name) for column in row.__table__.columns})
 
     @classmethod
-    async def _download_media_fallback(
-        cls,
-        db: AsyncSession,
-        account: TgAccount,
-        message: TgMessage,
-        medias: list[Any],
-        source_messages: list[Any],
-    ) -> list[str]:
-        source_by_id = cls._source_messages_by_id(source_messages)
-        storage = TelegramStorageService()
-        file_paths = []
-        for media in medias:
-            storage = TelegramStorageService.for_media(media) if getattr(media, 'storage_kind', 'cache') == 'archive' else TelegramStorageService()
-            if getattr(media, 'local_path', None):
-                file_paths.append(str(storage.base_dir / media.local_path))
-                continue
-            if getattr(media, 'storage_kind', 'cache') == 'archive':
-                # Permanent collection files are written only by the download worker.
-                continue
-            source_message_id = getattr(media, 'source_telegram_message_id', None)
-            source_message = source_by_id.get(source_message_id)
-            if not source_message:
-                continue
-            try:
-                media_path = await storage.save_message_media(source_message, account.account_id, message.message_id)
-            except Exception:
-                continue
-            if not media_path:
-                continue
-            await TelegramDao.update_media_local_path(db, media.media_id, media_path.relative_path)
-            file_paths.append(str(media_path.absolute_path))
-        return file_paths
-
-    @classmethod
-    async def _complete_fallback_file_paths(
-        cls,
-        db: AsyncSession,
-        account: TgAccount,
-        message: TgMessage,
-        medias: list[Any],
-        source_messages: list[Any],
-    ) -> list[str]:
-        file_paths = await cls._download_media_fallback(db, account, message, medias, source_messages)
-        return file_paths if len(file_paths) == len(medias) else []
-
-    @classmethod
-    async def forward_to_chats(
-        cls,
-        db: AsyncSession,
-        account: TgAccount,
-        message: TgMessage,
-        target_chats: list[TgChat],
-        forward_type: str,
-        source_messages: list[Any] | None = None,
-        media_source_ids: list[int] | None = None,
-        retry_record: TgForwardRecord | None = None,
-    ) -> list[Any]:
-        client = await TelegramClientManager.get_authorized_client(account)
-        default_ad_text = await TelegramDao.get_enabled_ad_text(db)
-        target_ad_text_ids = sorted({chat.ad_text_id for chat in target_chats if getattr(chat, 'ad_text_id', None)})
-        target_ad_texts = await TelegramDao.get_ad_texts_by_ids(db, target_ad_text_ids)
-        ad_text_map = {ad_text.ad_id: ad_text.ad_content for ad_text in target_ad_texts}
-        clean_rules = await TelegramDao.get_enabled_clean_rules(db)
-        medias = await TelegramDao.get_media_by_message_id(db, message.message_id)
-        if media_source_ids is not None:
-            medias = [media for media in medias if media.source_telegram_message_id in media_source_ids]
-        target_chat_ids = [chat.chat_id for chat in target_chats]
-        ad_text_by_target_id = {
-            chat.chat_id: ad_text_map.get(getattr(chat, 'ad_text_id', None), default_ad_text.ad_content if default_ad_text else None)
-            for chat in target_chats
-        }
-        cleaned_message_text = ContentCleanPolicy.apply(message.message_text, clean_rules)
-        dispatcher = ForwardDispatcher(client)
-        if medias:
-            source_media_messages = list(source_messages or [])
-            if not source_media_messages and retry_record is None:
-                source_media_messages = await cls._load_source_media_messages(client, message, medias)
-            complete_source_media_messages = cls._complete_source_media_messages(medias, source_media_messages)
-            if complete_source_media_messages:
-                results = await dispatcher.dispatch_files(
-                    message.message_id,
-                    target_chat_ids,
-                    complete_source_media_messages,
-                    cleaned_message_text,
-                    ad_text_by_target_id,
-                    forward_type,
-                )
-                failed_results = [result for result in results if result.status != 'success']
-                if failed_results:
-                    file_paths = await cls._complete_fallback_file_paths(db, account, message, medias, complete_source_media_messages)
-                    if file_paths:
-                        retry_results = await dispatcher.dispatch_files(
-                            message.message_id,
-                            [result.target_chat_id for result in failed_results],
-                            file_paths,
-                            cleaned_message_text,
-                            ad_text_by_target_id,
-                            forward_type,
-                        )
-                        retry_map = {result.target_chat_id: result for result in retry_results}
-                        results = [retry_map.get(result.target_chat_id, result) for result in results]
-            else:
-                file_paths = await cls._complete_fallback_file_paths(db, account, message, medias, source_media_messages)
-                if file_paths:
-                    results = await dispatcher.dispatch_files(
-                        message.message_id,
-                        target_chat_ids,
-                        file_paths,
-                        cleaned_message_text,
-                        ad_text_by_target_id,
-                        forward_type,
-                    )
-                else:
-                    results = cls._media_unavailable_results(message.message_id, target_chat_ids, forward_type)
-        else:
-            results = await dispatcher.dispatch_text(
-                message.message_id,
-                target_chat_ids,
-                cleaned_message_text,
-                ad_text_by_target_id,
-                forward_type,
-            )
-        # The download worker owns archive files. Persist only failed destinations
-        # until their exact media subset is ready, without re-sending successful targets.
-        if (
-            forward_type == 'auto' and retry_record is None and ArchiveConfig.archive_enabled
-            and any(getattr(media, 'download_status', None) in {'queued', 'retry', 'downloading'} for media in medias)
-            and all(
-                getattr(media, 'local_path', None)
-                or (
-                    getattr(media, 'storage_kind', 'cache') == 'archive'
-                    and getattr(media, 'download_status', None) in {'queued', 'retry', 'downloading'}
-                )
-                for media in medias
-            )
-        ):
-            results = [
-                replace(result, status='waiting_download', error_message='等待素材下载完成后补发')
-                if result.status != 'success' else result for result in results
-            ]
-        await cls._persist_forward_results(
-            db, account, message, target_chats, results, forward_type,
-            cls._source_message_ids(message, medias), retry_record,
-        )
-        return results
-
-    @classmethod
-    async def resume_waiting_forward(cls, db: AsyncSession, record: TgForwardRecord, message: TgMessage | None) -> None:
-        """Called under the parent message lock, also used by ingest and local cleanup."""
+    async def prepare(
+        cls, db: AsyncSession, record: TgForwardRecord, message: TgMessage | None,
+    ) -> dict[str, Any] | None:
         source_ids = json.loads(record.source_message_ids or '[]')
         account = await db.get(TgAccount, record.account_id)
         target = await db.get(TgChat, record.target_chat_pk) if record.target_chat_pk else None
         error = None
-        if not message or message.is_sensitive == 'Y':
+        if not message or (record.forward_type == 'auto' and message.is_sensitive == 'Y'):
             error = '来源消息不存在或已被敏感词拦截'
         elif not account or account.status != '0' or not target or target.status != '0' or target.can_send != 'Y':
             error = '发送账号或目标已停用'
-        else:
+        elif target.chat_id != record.target_chat_id:
+            error = '目标频道已变更，请重新提交发送'
+        elif record.forward_type == 'auto':
             rules = await TelegramDao.get_enabled_rules_for_account(db, account.account_id)
             if not any(
-                rule.forward_enabled == 'Y' and rule.forward_mode == 'copy_clean'
+                rule.forward_enabled == 'Y' and rule.forward_mode == record.forward_mode
                 and message.source_chat_pk in ListenerRulePolicy.source_chat_pks(rule)
                 and target.chat_pk in ListenerRulePolicy.parse_chat_pks(rule.target_chat_pks)
                 for rule in rules
             ):
                 error = '对应的自动转发规则已停用'
-        if error is None:
-            medias = [
-                media for media in await TelegramDao.get_media_by_message_id(db, message.message_id)
-                if media.source_telegram_message_id in source_ids
-            ]
-            if not source_ids or len(medias) != len(source_ids) or any(
-                media.download_status not in {'queued', 'retry', 'downloading', 'ready'} for media in medias
-            ):
-                error = '待补发素材已清理、下载失败或不可用，请处理后手动转发'
-            elif any(media.download_status != 'ready' for media in medias):
-                return
-        if error is None:
-            await cls.forward_to_chats(
-                db, account, message, [target], 'auto', media_source_ids=source_ids, retry_record=record,
-            )
-        else:
+        if error:
             record.status, record.error_message = 'failed', error
-            if message and message.is_sensitive != 'Y':
-                message.auto_forward_status = 'partial_failed'
-                message.update_time = datetime.now()
+            record.lease_token = record.lease_until = None
+            await cls.refresh_status(db, message)
+            return None
+        all_medias = await TelegramDao.get_media_by_message_id(db, message.message_id)
+        # Legacy records without source IDs include the original message's files.
+        medias = [media for media in all_medias if not source_ids or media.source_telegram_message_id in source_ids]
+        if record.delivery_stage == 'local' and any(
+            media.storage_kind == 'archive' and media.download_status in {'queued', 'retry', 'downloading'}
+            for media in medias
+        ):
+            return None
+        default_ad = await TelegramDao.get_enabled_ad_text(db)
+        ads = await TelegramDao.get_ad_texts_by_ids(db, [target.ad_text_id] if target.ad_text_id else [])
+        content = ContentCleanPolicy.apply(message.message_text, await TelegramDao.get_enabled_clean_rules(db))
+        return {
+            'account': cls._copy(account), 'message': cls._copy(message), 'target': cls._copy(target),
+            'medias': [cls._copy(media) for media in medias], 'source_ids': source_ids,
+            'mode': record.forward_mode, 'forward_type': record.forward_type,
+            'content': content, 'ad': ads[0].ad_content if ads else default_ad.ad_content if default_ad else None,
+            'local_only': record.delivery_stage == 'local',
+        }
+
+    @classmethod
+    async def execute(cls, payload: dict[str, Any]) -> tuple[ForwardDispatchResult, dict[int, str]]:  # noqa: PLR0912
+        """No database session, lock or ORM object is passed into network operations."""
+        account, message, target = payload['account'], payload['message'], payload['target']
+        medias, source_ids = payload['medias'], payload['source_ids']
+        forward_type = payload['forward_type']
+        paths = {}
+        try:
+            client = await TelegramClientManager.get_authorized_client(account)
+            if payload['mode'] == 'native_hidden':
+                ids = source_ids or cls._source_message_ids(message, medias)
+                if not ids or any(source_id is None for source_id in ids):
+                    raise RuntimeError('源消息不可用')
+                sent = await client.forward_messages(
+                    ForwardDispatcher._normalize_target_chat(target.chat_id),
+                    ids,
+                    from_peer=ForwardDispatcher._normalize_target_chat(message.source_chat_id),
+                    drop_author=True, drop_media_captions=False,
+                )
+                if isinstance(sent, list):
+                    sent = sent[0] if sent else None
+                return ForwardDispatchResult(message.message_id, target.chat_id, forward_type, 'success', getattr(sent, 'id', None)), paths
+            dispatcher = ForwardDispatcher(client)
+            if not medias:
+                if payload['local_only']:
+                    raise RuntimeError('待补发的素材记录已缺失')
+                results = await dispatcher.dispatch_text(message.message_id, [target.chat_id], payload['content'], payload['ad'], forward_type)
+                return results[0], paths
+            sources = []
+            if not payload['local_only']:
+                try:
+                    ids = [media.source_telegram_message_id for media in medias]
+                    if all(source_id is not None for source_id in ids):
+                        sources = await client.get_messages(TelegramClientManager._normalize_chat_ref(message.source_chat_id), ids=ids)
+                        sources = list(sources) if sources else []
+                except Exception:
+                    sources = []
+            source_map = {item.id: item for item in sources if item and getattr(item, 'media', None)}
+            if all(media.source_telegram_message_id in source_map for media in medias):
+                results = await dispatcher.dispatch_files(
+                    message.message_id, [target.chat_id], [source_map[media.source_telegram_message_id] for media in medias],
+                    payload['content'], payload['ad'], forward_type,
+                )
+                if results[0].status == 'success':
+                    return results[0], paths
+            files = []
+            for media in medias:
+                storage = TelegramStorageService.for_media(media)
+                if media.storage_kind == 'archive' and media.download_status != 'ready':
+                    continue
+                if media.local_path and await run_blocking((storage.base_dir / media.local_path).is_file):
+                    files.append(str(storage.base_dir / media.local_path))
+                elif media.storage_kind == 'cache' and media.source_telegram_message_id in source_map:
+                    saved = await storage.save_message_media(source_map[media.source_telegram_message_id], account.account_id, message.message_id)
+                    if saved:
+                        files.append(str(saved.absolute_path))
+                        paths[media.media_id] = saved.relative_path
+            if len(files) == len(medias):
+                results = await dispatcher.dispatch_files(message.message_id, [target.chat_id], files, payload['content'], payload['ad'], forward_type)
+                return results[0], paths
+            waiting = ArchiveConfig.archive_enabled and any(
+                media.storage_kind == 'archive' and media.download_status in {'queued', 'retry', 'downloading'} for media in medias
+            ) and all(
+                media.local_path or media.media_id in paths
+                or (media.storage_kind == 'archive' and media.download_status in {'queued', 'retry', 'downloading'})
+                for media in medias
+            )
+            return ForwardDispatchResult(
+                message.message_id, target.chat_id, forward_type, 'waiting_download' if waiting else 'failed',
+                error_message='等待素材下载完成后补发' if waiting else '媒体文件不可用，请处理后手动转发',
+            ), paths
+        except Exception as exc:
+            return ForwardDispatchResult(message.message_id, target.chat_id, forward_type, 'failed', error_message=str(exc)), paths
+
+    @staticmethod
+    async def refresh_status(db: AsyncSession, message: TgMessage | None) -> None:
+        if not message or message.is_sensitive == 'Y':
+            return
+        await db.flush()
+        records = await TelegramDao.get_auto_forward_records(db, message.message_id)
+        if records:
+            states = {record.status for record in records}
+            message.auto_forward_status = (
+                'partial_failed' if 'failed' in states else
+                'pending' if states & {'queued', 'waiting_download', 'sending'} else 'success'
+            )
+            message.update_time = datetime.now()
 
 
 @dataclass(frozen=True)
@@ -892,20 +694,28 @@ class TelegramMediaCleanupService:
         skipped_count = 0
         try:
             for media in media_list:
-                media_path = cls._resolve_media_path(base_path, media.local_path)
-                if not media_path:
+                if media_runtime.busy(media.message_id):
                     skipped_count += 1
                     continue
-                if media_path.exists():
-                    if media_path.is_file():
-                        media_path.unlink()
-                        deleted_count += 1
-                        clear_media_ids.append(media.media_id)
-                    else:
+                with media_runtime.cleanup([media.message_id]):
+                    if not await TelegramDao.lock_message_for_media_cleanup(db, media.message_id):
                         skipped_count += 1
-                else:
-                    missing_count += 1
-                    clear_media_ids.append(media.media_id)
+                        continue
+                    await db.refresh(media)
+                    media_path = cls._resolve_media_path(base_path, media.local_path)
+                    if not media_path:
+                        skipped_count += 1
+                        continue
+                    if media_path.exists():
+                        if media_path.is_file():
+                            media_path.unlink()
+                            deleted_count += 1
+                            clear_media_ids.append(media.media_id)
+                        else:
+                            skipped_count += 1
+                    else:
+                        missing_count += 1
+                        clear_media_ids.append(media.media_id)
             await TelegramDao.clear_media_local_paths(db, clear_media_ids)
             await db.commit()
             return TelegramMediaCleanupResult(
@@ -977,7 +787,7 @@ class TelegramMessageIngestService:
             }
             if collect:
                 media_data.update(
-                    caption=cls._message_text(message), storage_kind='archive',
+                    caption=cls._message_text(message), storage_kind='archive' if downloadable else 'cache',
                     source_media_id=getattr(getattr(message, 'photo', None) or getattr(message, 'document', None), 'id', None),
                     download_status=('blocked' if db_message.is_sensitive == 'Y' else 'queued') if downloadable else 'skipped',
                 )
@@ -986,7 +796,7 @@ class TelegramMessageIngestService:
         return added
 
     @classmethod
-    async def _forward_source_message_by_rules(
+    async def _enqueue_by_rules(
         cls,
         db: AsyncSession,
         account: TgAccount,
@@ -1007,7 +817,7 @@ class TelegramMessageIngestService:
             source_ids = media_source_ids if media_source_ids is not None else [item.id for item in source_messages]
             covered: dict[str, set[int]] = {}
             for record in await TelegramDao.get_auto_forward_records(db, db_message.message_id):
-                if record.status in {'success', 'waiting_download'}:
+                if record.status in {'success', 'queued', 'waiting_download', 'sending'}:
                     covered.setdefault(record.target_chat_id, set()).update(json.loads(record.source_message_ids or '[]'))
             batches: dict[tuple[int, ...], list[TgChat]] = {}
             for target in targets:
@@ -1015,36 +825,10 @@ class TelegramMessageIngestService:
                 if remaining:
                     batches.setdefault(remaining, []).append(target)
             for remaining, batch_targets in batches.items():
-                try:
-                    subset = {'media_source_ids': list(remaining)} if media_source_ids is not None or list(remaining) != source_ids else {}
-                    if getattr(rule, 'forward_mode', 'copy_clean') == 'native_hidden':
-                        await TelegramForwardService.forward_native_hidden_to_chats(
-                            db, account, db_message, batch_targets, 'auto', **subset,
-                        )
-                    else:
-                        await TelegramForwardService.forward_to_chats(
-                            db, account, db_message, batch_targets, 'auto',
-                            source_messages=[item for item in source_messages if item.id in remaining], **subset,
-                        )
-                except Exception as exc:  # noqa: PERF203 - record failures only for this media subset
-                    for target in batch_targets:
-                        await TelegramDao.add_forward_record(
-                            db,
-                            {
-                                'message_id': db_message.message_id,
-                                'account_id': account.account_id,
-                                'target_chat_pk': target.chat_pk,
-                                'target_chat_id': target.chat_id,
-                                'target_chat_title': target.chat_title,
-                                'forward_type': 'auto',
-                                'source_message_ids': json.dumps(remaining),
-                                'status': 'failed',
-                                'sent_telegram_message_id': None,
-                                'error_message': str(exc),
-                                'create_time': datetime.now(),
-                            },
-                        )
-                    raise
+                await TelegramForwardService.enqueue(
+                    db, account, db_message, batch_targets, 'auto', list(remaining),
+                    getattr(rule, 'forward_mode', 'copy_clean'),
+                )
 
     @classmethod
     async def ingest_event(cls, db: AsyncSession, account: TgAccount, source_chat: TgChat, event: Any) -> TgMessage:
@@ -1099,13 +883,10 @@ class TelegramMessageIngestService:
                     db_message.update_time = datetime.now()
                 if new_messages and db_message.is_sensitive != 'Y':
                     # Replays add nothing; late members must still reach each target.
-                    try:
-                        await cls._forward_source_message_by_rules(
-                            db, account, source_chat, db_message, new_messages,
-                            media_source_ids=[item.id for item in new_messages],
-                        )
-                    except Exception:
-                        db_message.auto_forward_status = 'partial_failed'
+                    await cls._enqueue_by_rules(
+                        db, account, source_chat, db_message, new_messages,
+                        media_source_ids=[item.id for item in new_messages],
+                    )
             return db_message
         words = await TelegramDao.get_enabled_words(db)
         match_result = SensitiveWordMatcher(words, match_case=False).match(message_text)
@@ -1128,12 +909,5 @@ class TelegramMessageIngestService:
         await db.flush()
         await cls._save_message_medias(db, db_message, messages, collect)
         if not match_result.is_blocked and forwarding:
-            try:
-                await cls._forward_source_message_by_rules(db, account, source_chat, db_message, messages)
-            except Exception:
-                await TelegramDao.update_message(db, {
-                    'message_id': db_message.message_id,
-                    'auto_forward_status': 'partial_failed',
-                    'update_time': datetime.now(),
-                })
+            await cls._enqueue_by_rules(db, account, source_chat, db_message, messages)
         return db_message

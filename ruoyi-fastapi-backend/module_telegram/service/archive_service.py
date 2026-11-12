@@ -13,9 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.env import ArchiveConfig, JwtConfig
 from exceptions.exception import ServiceException
 from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveTask
-from module_telegram.entity.do.telegram_do import TgMessage, TgMessageMedia
+from module_telegram.entity.do.telegram_do import TgForwardRecord, TgMessage, TgMessageMedia
 from module_telegram.entity.vo.archive_vo import ArchiveLibraryQuery, ArchiveSubmitModel
 from module_telegram.service.archive_storage import load_storages, normalize_path
+from module_telegram.service.media_runtime import media_runtime
 from utils.common_util import CamelCaseUtil
 
 
@@ -252,76 +253,86 @@ class TelegramArchiveService:
         return count
 
     @staticmethod
-    async def cleanup_local(db: AsyncSession, message_ids: list[int]) -> dict[str, Any]:
+    async def cleanup_local(db: AsyncSession, message_ids: list[int]) -> dict[str, Any]:  # noqa: PLR0912
         ids = sorted(set(message_ids))
-        selected = []
-        for message_id in ids:
-            message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
-            if not message or message.collected != 'Y':
-                raise ServiceException(message=f'采集记录 {message_id} 不存在')
-            medias = (
-                await db.scalars(
+        with media_runtime.cleanup(ids):
+            selected = []
+            for message_id in ids:
+                message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
+                if not message or message.collected != 'Y':
+                    raise ServiceException(message=f'采集记录 {message_id} 不存在')
+                active_forward = await db.scalar(
+                    select(TgForwardRecord.record_id).where(
+                        TgForwardRecord.message_id == message_id,
+                        TgForwardRecord.status == 'sending',
+                        TgForwardRecord.lease_until > datetime.now(),
+                    ).limit(1)
+                )
+                if active_forward:
+                    raise ServiceException(message=f'消息 {message_id} 正在补发，暂不能清理本地素材')
+                medias = (
+                    await db.scalars(
+                        select(TgMessageMedia)
+                        .where(TgMessageMedia.message_id == message_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).all()
+                active_task = await db.scalar(
+                    select(TgArchiveTask.task_id)
+                    .where(
+                        TgArchiveTask.message_id == message_id,
+                        TgArchiveTask.status.in_(['queued', 'uploading', 'retry']),
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if active_task or any(media.download_status == 'downloading' for media in medias):
+                    raise ServiceException(message=f'消息 {message_id} 正在下载或等待归档完成，暂不能清理')
+                for media in medias:
+                    if media.storage_kind != 'archive' or media.download_status in {'skipped', 'disabled', 'deleted'}:
+                        continue
+                    paths = cleanup_paths(message.account_id, message_id, media)
+                    selected.append((message_id, media.media_id, paths))
+                    media.download_status = 'deleting'
+                    media.lease_token = media.lease_until = media.next_retry_at = None
+                    media.last_error = None
+            # Persist intent before touching disk. A crash leaves retryable cleanup,
+            # never a ready record pointing at a file that was already removed.
+            await db.commit()
+            freed, cleaned, errors = 0, set(), []
+            for message_id in ids:
+                await db.scalar(select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update())
+            for message_id, media_id, paths in selected:
+                media = await db.scalar(
                     select(TgMessageMedia)
-                    .where(TgMessageMedia.message_id == message_id)
+                    .where(TgMessageMedia.media_id == media_id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
-            ).all()
-            active_task = await db.scalar(
-                select(TgArchiveTask.task_id)
-                .where(
-                    TgArchiveTask.message_id == message_id,
-                    TgArchiveTask.status.in_(['queued', 'uploading', 'retry']),
-                )
-                .with_for_update()
-                .limit(1)
-            )
-            if active_task or any(media.download_status == 'downloading' for media in medias):
-                raise ServiceException(message=f'消息 {message_id} 正在下载或等待归档完成，暂不能清理')
-            for media in medias:
-                if media.storage_kind != 'archive' or media.download_status in {'skipped', 'disabled', 'deleted'}:
+                if media.download_status != 'deleting':
                     continue
-                paths = cleanup_paths(message.account_id, message_id, media)
-                selected.append((message_id, media.media_id, paths))
-                media.download_status = 'deleting'
-                media.lease_token = media.lease_until = media.next_retry_at = None
-                media.last_error = None
-        # Persist intent before touching disk. A crash leaves retryable cleanup,
-        # never a ready record pointing at a file that was already removed.
-        await db.commit()
-        freed, cleaned, errors = 0, set(), []
-        for message_id in ids:
-            await db.scalar(select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update())
-        for message_id, media_id, paths in selected:
-            media = await db.scalar(
-                select(TgMessageMedia)
-                .where(TgMessageMedia.media_id == media_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            if media.download_status != 'deleting':
-                continue
-            try:
-                for path in paths:
-                    if path.resolve() != path:
-                        raise OSError('symbolic link')
-                    try:
-                        size = path.stat().st_size
-                        path.unlink()
-                        freed += size
-                    except FileNotFoundError:
-                        pass
-            except OSError:
-                media.last_error = '本地文件清理失败，请检查目录权限后再次清理'
-                errors.append({'messageId': message_id, 'mediaId': media_id, 'message': media.last_error})
-                continue
-            media.download_status, media.local_path = 'deleted', ''
-            media.downloaded_bytes, media.attempts = 0, 0
-            media.sha256 = media.last_error = None
-            cleaned.add(message_id)
-        result = {'cleanedMessages': len(cleaned), 'freedBytes': freed, 'errors': errors}
-        await db.commit()
-        return result
+                try:
+                    for path in paths:
+                        if path.resolve() != path:
+                            raise OSError('symbolic link')
+                        try:
+                            size = path.stat().st_size
+                            path.unlink()
+                            freed += size
+                        except FileNotFoundError:
+                            pass
+                except OSError:
+                    media.last_error = '本地文件清理失败，请检查目录权限后再次清理'
+                    errors.append({'messageId': message_id, 'mediaId': media_id, 'message': media.last_error})
+                    continue
+                media.download_status, media.local_path = 'deleted', ''
+                media.downloaded_bytes, media.attempts = 0, 0
+                media.sha256 = media.last_error = None
+                cleaned.add(message_id)
+            result = {'cleanedMessages': len(cleaned), 'freedBytes': freed, 'errors': errors}
+            await db.commit()
+            return result
 
     @classmethod
     async def submit(cls, db: AsyncSession, request: ArchiveSubmitModel, username: str) -> list[int]:

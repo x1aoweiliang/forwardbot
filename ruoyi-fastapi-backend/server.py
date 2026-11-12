@@ -34,14 +34,12 @@ async def _start_background_tasks(app: FastAPI) -> None:
     await SchedulerUtil.init_system_scheduler(app.state.redis)
     app.state.log_aggregator_task = asyncio.create_task(LogAggregatorService.consume_stream(app.state.redis))
 
-    # Archive mode is restricted to one process. A stale logging lock after a
-    # restart must not leave its listener and durable queues permanently idle.
-    if ArchiveConfig.archive_enabled or getattr(app.state, 'startup_log_enabled', False):
+    # A logging gate must not disable the single-process listener/outbox after restart.
+    if AppConfig.app_workers == 1 or getattr(app.state, 'startup_log_enabled', False):
         async with AsyncSessionLocal() as query_db:
             await TelegramClientManager.restore_enabled_listeners(query_db)
-        if ArchiveConfig.archive_enabled:
-            app.state.archive_worker = TelegramArchiveWorker()
-            app.state.archive_worker.start()
+        app.state.archive_worker = TelegramArchiveWorker()
+        app.state.archive_worker.start()
 
 
 async def _stop_background_tasks(app: FastAPI) -> None:

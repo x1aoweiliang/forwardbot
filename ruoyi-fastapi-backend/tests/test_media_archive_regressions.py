@@ -13,7 +13,8 @@ from sqlalchemy import MetaData, Table, create_engine, inspect, select
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from test_media_archive import database, ingest, ready_media, source_message
+from test_media_archive import database, ready_media, source_message
+from test_media_archive import ingest_and_dispatch as ingest
 
 from config.env import ArchiveConfig, TransportCryptoConfig
 from module_telegram.entity.do.telegram_do import (
@@ -51,6 +52,14 @@ class ForwardClient:
         return SimpleNamespace(id=500 + len(self.calls))
 
     async def get_messages(self, entity: Any, ids: int) -> Any:
+        if isinstance(ids, list):
+            messages = [source_message(source_id) for source_id in ids]
+            async def download_media(file: str) -> str:
+                Path(file).write_bytes(b'abcdef')
+                return file
+            for message in messages:
+                message.download_media = download_media
+            return messages
         self.download_ids.append(ids)
         return source_message(ids)
 
@@ -153,14 +162,14 @@ def test_pending_forward_survives_restart_and_uses_only_failed_targets_and_origi
                 message_id = await ingest(db, [source_message(10, grouped_id=777)])
                 await ingest(db, [source_message(11, grouped_id=777)])
                 assert (await db.get(TgMessage, message_id)).auto_forward_status == 'pending'
-            await TelegramArchiveWorker().forward_waiting()
+            await TelegramArchiveWorker().deliver_pending()
             assert len(client.calls) == 4
             worker = TelegramArchiveWorker()
             while job := await worker.claim('download'):
                 await worker.download(job)
             # New worker and sessions, with no in-memory delivery state.
-            await TelegramArchiveWorker().forward_waiting()
-            await TelegramArchiveWorker().forward_waiting()
+            await TelegramArchiveWorker().deliver_pending()
+            await TelegramArchiveWorker().deliver_pending()
             assert client.calls[4:] == [(-1003, (10,), True), (-1003, (11,), True)]
             assert client.download_ids == [10, 11]  # retry does not re-fetch source references
             async with sessions() as db:
@@ -202,7 +211,7 @@ def test_pending_forward_obeys_cleanup_and_current_controls(
                 else:
                     monkeypatch.setattr(TelegramClientManager, '_handlers', {})
                 await db.commit()
-            await TelegramArchiveWorker().forward_waiting()
+            await TelegramArchiveWorker().deliver_pending()
             assert len(client.calls) == 2
             async with sessions() as db:
                 pending = await db.scalar(select(TgForwardRecord).where(TgForwardRecord.target_chat_pk == 3))

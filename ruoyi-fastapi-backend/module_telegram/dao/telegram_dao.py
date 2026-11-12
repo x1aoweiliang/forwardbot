@@ -175,6 +175,20 @@ class TelegramDao:
         await db.execute(update(TgMessageMedia).where(TgMessageMedia.media_id.in_(media_ids)).values(local_path=''))
 
     @classmethod
+    async def lock_message_for_media_cleanup(cls, db: AsyncSession, message_id: int) -> bool:
+        # Serialize with delivery claims. Skip busy messages without stalling cleanup.
+        parent = await db.scalar(
+            select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update(skip_locked=True)
+        )
+        if parent is None:
+            return False
+        pending = await db.scalar(select(TgForwardRecord.record_id).where(
+            TgForwardRecord.message_id == message_id,
+            TgForwardRecord.status.in_(['queued', 'waiting_download', 'sending']),
+        ).limit(1))
+        return pending is None
+
+    @classmethod
     async def update_media_local_path(cls, db: AsyncSession, media_id: int, local_path: str) -> None:
         await db.execute(update(TgMessageMedia).where(TgMessageMedia.media_id == media_id).values(local_path=local_path))
 

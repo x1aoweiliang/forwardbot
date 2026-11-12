@@ -41,7 +41,7 @@ const accountOptions = ref([]);
 const messageOptions = ref([]);
 const targetOptions = ref([]);
 const forwardTypeOptions = [{ label: "自动", value: "auto" }, { label: "手动", value: "manual" }, { label: "主动发送", value: "dialog" }];
-const sendStatusOptions = [{ label: "成功", value: "success" }, { label: "等待下载后补发", value: "waiting_download" }, { label: "失败", value: "failed" }, { label: "部分失败", value: "partial_failed" }];
+const sendStatusOptions = [{ label: "等待发送", value: "queued" }, { label: "成功", value: "success" }, { label: "等待下载后补发", value: "waiting_download" }, { label: "发送中", value: "sending" }, { label: "失败", value: "failed" }, { label: "部分失败", value: "partial_failed" }];
 const data = reactive({ queryParams: { pageNum: 1, pageSize: 10 } });
 const { queryParams } = toRefs(data);
 function getList() { loading.value = true; forwardRecordApi.list(queryParams.value).then((res) => { rows.value = res.rows; total.value = res.total; loading.value = false; }); }
