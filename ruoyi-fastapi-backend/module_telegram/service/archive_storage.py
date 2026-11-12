@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -261,7 +262,16 @@ class QuarkArchiveStorage:
         data = self._run(['user'])
         uid = data.get('uid')
         if not uid:
-            raise ArchiveStorageError('夸克未返回账号 ID，请检查 kuake_cli 版本及登录状态')
+            # Current kuake user responses omit uid; the validated login cookie contains it.
+            cookies = SimpleCookie()
+            try:
+                cookies.load(self.cookie)
+            except CookieError:
+                raise ArchiveStorageError('夸克登录 Cookie 格式不正确，请重新导入完整 Cookie') from None
+            identity = cookies.get('__uid')
+            uid = identity.value if identity else ''
+        if not uid:
+            raise ArchiveStorageError('夸克登录凭据缺少账号 ID，请重新登录或导入完整 Cookie')
         return {'uid': str(uid), 'nickname': str(data.get('nickname') or '夸克账号')}
 
     def _remote_path(self, path: str) -> str:

@@ -83,6 +83,20 @@ def test_quark_creates_nested_directories_and_verifies_upload(
         storage.upload(source, '旅行', 'photo.jpg', 'hash')
 
 
+def test_account_uses_login_cookie_identity_when_cli_omits_uid(
+    monkeypatch: pytest.MonkeyPatch, quark: StorageSpec
+) -> None:
+    storage = QuarkArchiveStorage(quark, '__pus=secret; __uid=account-123; __puus=private')
+    # Shape observed from the deployed kuake user command: nickname but no uid.
+    monkeypatch.setattr(storage, '_run', lambda _: {'nickname': '素材账号', 'mobilekps': 'account-key'})
+    assert storage.account() == {'uid': 'account-123', 'nickname': '素材账号'}
+    storage.cookie = '__pus=secret; __uid=account-456; __puus=private'
+    assert storage.account()['uid'] == 'account-456'
+    storage.cookie = '__pus=secret; __puus=private'
+    with pytest.raises(ArchiveStorageError, match='缺少账号 ID'):
+        storage.account()
+
+
 class FakeLogin:
     def __init__(self) -> None:
         self.ready = False
