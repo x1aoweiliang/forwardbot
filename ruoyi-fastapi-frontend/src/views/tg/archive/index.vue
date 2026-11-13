@@ -4,6 +4,7 @@
       <div><h2>素材库</h2><p>自动收集群消息，保留原文，整理并归档图片和视频。</p></div>
       <div class="library-actions" v-hasPermi="['tg:archive:write']">
         <el-button v-if="quarkStorages.length" @click="openQuark">夸克账号</el-button>
+        <el-button :disabled="!selected.length" @click="clearSelection">清除选择 {{ selected.length || '' }}</el-button>
         <el-button type="danger" plain :disabled="!selected.length" :loading="cleaning" @click="cleanupLocal(selected)">清理所选本地素材</el-button>
         <el-button type="primary" :disabled="!selected.length || selected.some(row => row.downloadState !== 'ready' || !row.readyCount)" @click="openArchive(selected)">归档所选 {{ selected.length || '' }}</el-button>
       </div>
@@ -155,6 +156,7 @@ async function refresh(silent = false) {
   finally { if (sequence === librarySequence) loading.value = false; }
 }
 function search() { query.pageNum = 1; refresh(); }
+function clearSelection() { libraryTable.value?.clearSelection(); selected.value = []; }
 async function changeAccount() {
   query.sourceChatPk = undefined;
   const result = await chatApi.list({ pageNum: 1, pageSize: 1000, accountId: query.accountId, canListen: 'Y' });
@@ -191,7 +193,7 @@ async function cleanupLocal(messages) {
   cleaning.value = true;
   try {
     const result = await archiveApi.cleanup({ messageIds: ids });
-    libraryTable.value?.clearSelection(); selected.value = [];
+    clearSelection();
     Object.keys(previewUrls).forEach(key => delete previewUrls[key]);
     const message = `${result.msg}，本次删除文件 ${formatBytes(result.data.freedBytes)}`;
     if (result.data.errors.length) proxy.$modal.msgWarning(message); else proxy.$modal.msgSuccess(message);
@@ -286,7 +288,12 @@ async function createFolder() {
 }
 async function submitArchive() {
   submitting.value = true;
-  try { const result = await archiveApi.submit({ messageIds: archiveIds.value, storageId: archiveForm.storageId, targetPath: folderPath.value }); proxy.$modal.msgSuccess(result.msg); archiveOpen.value = false; await Promise.all([refresh(true), refreshDetail()]); }
+  try {
+    const result = await archiveApi.submit({ messageIds: archiveIds.value, storageId: archiveForm.storageId, targetPath: folderPath.value });
+    clearSelection();
+    proxy.$modal.msgSuccess(result.msg); archiveOpen.value = false;
+    await Promise.all([refresh(true), refreshDetail()]);
+  }
   finally { submitting.value = false; }
 }
 onMounted(async () => {
