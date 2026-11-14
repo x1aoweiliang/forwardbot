@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.env import ArchiveConfig, JwtConfig
 from exceptions.exception import ServiceException
-from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveTask
+from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveMessage, TgArchiveTask
 from module_telegram.entity.do.telegram_do import TgForwardRecord, TgMessage, TgMessageMedia
 from module_telegram.entity.vo.archive_vo import ArchiveLibraryQuery, ArchiveSubmitModel
 from module_telegram.service.archive_storage import load_storages, normalize_path
@@ -85,8 +85,9 @@ class TelegramArchiveService:
     @staticmethod
     def _archived() -> Any:
         return exists().where(
-            TgArchiveTask.message_id == TgMessage.message_id,
-            TgArchiveTask.media_revision == TgMessage.media_revision,
+            TgArchiveMessage.message_id == TgMessage.message_id,
+            TgArchiveMessage.media_revision == TgMessage.media_revision,
+            TgArchiveTask.task_id == TgArchiveMessage.task_id,
             TgArchiveTask.status == 'completed',
         )
 
@@ -197,7 +198,8 @@ class TelegramArchiveService:
             (
                 await db.execute(
                     select(TgArchiveTask)
-                    .where(TgArchiveTask.message_id == message_id)
+                    .join(TgArchiveMessage, TgArchiveMessage.task_id == TgArchiveTask.task_id)
+                    .where(TgArchiveMessage.message_id == message_id)
                     .order_by(TgArchiveTask.task_id.desc())
                 )
             )
@@ -205,6 +207,10 @@ class TelegramArchiveService:
             .all()
         )
         task_ids = [task.task_id for task in tasks]
+        revisions = dict((await db.execute(
+            select(TgArchiveMessage.task_id, TgArchiveMessage.media_revision)
+            .where(TgArchiveMessage.message_id == message_id)
+        )).all())
         items = (
             (await db.execute(select(TgArchiveItem).where(TgArchiveItem.task_id.in_(task_ids)))).scalars().all()
             if tasks
@@ -231,16 +237,23 @@ class TelegramArchiveService:
                 'storageId': task.storage_id,
                 'targetPath': task.target_path,
                 'packageName': task.package_name,
+                'archiveFormat': task.archive_format,
                 'status': task.status,
                 'lastError': task.last_error,
-                'mediaRevision': task.media_revision,
+                'mediaRevision': revisions[task.task_id],
                 'createTime': task.create_time,
                 'completedAt': task.completed_at,
                 'files': [
-                    {'name': item.file_name, 'status': item.status, 'error': item.last_error}
+                    {
+                        'name': item.file_name,
+                        'status': task.status if task.archive_format == 'zip' else item.status,
+                        'error': task.last_error if task.archive_format == 'zip' else item.last_error,
+                    }
                     for item in items
                     if item.task_id == task.task_id
+                    and (task.archive_format != 'zip' or item.media_id is None)
                 ],
+                'mediaCount': sum(item.task_id == task.task_id and item.media_id is not None for item in items),
             }
             for task in tasks
         ]
@@ -298,11 +311,12 @@ class TelegramArchiveService:
                 ).all()
                 active_task = await db.scalar(
                     select(TgArchiveTask.task_id)
+                    .join(TgArchiveMessage, TgArchiveMessage.task_id == TgArchiveTask.task_id)
                     .where(
-                        TgArchiveTask.message_id == message_id,
+                        TgArchiveMessage.message_id == message_id,
                         TgArchiveTask.status.in_(['queued', 'uploading', 'retry']),
                     )
-                    .with_for_update()
+                    .with_for_update(of=TgArchiveTask)
                     .limit(1)
                 )
                 if active_task or any(media.download_status == 'downloading' for media in medias):
@@ -353,48 +367,31 @@ class TelegramArchiveService:
             return result
 
     @classmethod
-    async def submit(cls, db: AsyncSession, request: ArchiveSubmitModel, username: str) -> list[int]:
+    async def submit(cls, db: AsyncSession, request: ArchiveSubmitModel, username: str) -> list[int]:  # noqa: PLR0912
         target_path = normalize_path(request.target_path)
         if request.storage_id not in {item.id for item in load_storages()}:
             raise ServiceException(message='存储目标尚未配置')
-        ids = set(request.message_ids)
-        ordered_ids = list(await db.scalars(
-            select(TgMessage.message_id).where(TgMessage.message_id.in_(ids)).order_by(
-                func.coalesce(TgMessage.sent_at, TgMessage.create_time),
-                TgMessage.telegram_message_id, TgMessage.message_id,
-            )
+        ids = sorted(set(request.message_ids))
+        # Lock every member in the same order used by cleanup and retry.
+        messages = list(await db.scalars(
+            select(TgMessage).where(TgMessage.message_id.in_(ids))
+            .order_by(TgMessage.message_id).with_for_update()
         ))
-        if len(ordered_ids) != len(ids):
+        if len(messages) != len(ids):
             raise ServiceException(message='部分采集记录不存在')
-        reserved = dict((await db.execute(
-            select(TgArchiveItem.file_name, TgArchiveItem.media_id)
-            .join(TgArchiveTask, TgArchiveTask.task_id == TgArchiveItem.task_id)
-            .where(
-                TgArchiveTask.storage_id == request.storage_id,
-                TgArchiveTask.target_path == target_path,
-                TgArchiveTask.package_name == '',
-            )
-        )).all())
-        result = []
-        for message_id in ordered_ids:
-            message = (
-                (await db.execute(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update()))
-                .scalars()
-                .first()
-            )
-            if not message or message.collected != 'Y' or message.is_sensitive == 'Y':
+        messages.sort(key=lambda message: (
+            message.sent_at or message.create_time or datetime.min,
+            message.telegram_message_id, message.message_id,
+        ))
+        files, members, reserved = [], [], set()
+        for message in messages:
+            message_id = message.message_id
+            if message.collected != 'Y' or message.is_sensitive == 'Y':
                 raise ServiceException(message=f'消息 {message_id} 不可归档')
-            medias = (
-                (
-                    await db.execute(
-                        select(TgMessageMedia)
-                        .where(TgMessageMedia.message_id == message_id)
-                        .order_by(TgMessageMedia.source_telegram_message_id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            medias = list(await db.scalars(
+                select(TgMessageMedia).where(TgMessageMedia.message_id == message_id)
+                .order_by(TgMessageMedia.source_telegram_message_id)
+            ))
             if any(media.download_status not in {'ready', 'skipped'} for media in medias):
                 raise ServiceException(message=f'消息 {message_id} 的素材尚未全部下载完成')
             selected = [media for media in medias if media.download_status == 'ready']
@@ -406,88 +403,66 @@ class TelegramArchiveService:
                     raise ServiceException(message=f'消息 {message_id} 的本地素材缺失')
                 original = Path(filenames[media.media_id])
                 name, number = original.name, 1
-                while name in reserved and reserved[name] != media.media_id:
+                while name.casefold() in reserved:
                     tail = f'_{message.telegram_message_id}_{media.media_id}'
                     if number > 1:
                         tail += f'_{number}'
                     name = f'{original.stem}{tail}{original.suffix}'
                     number += 1
-                filenames[media.media_id] = name
-                reserved[name] = media.media_id
-            manifest = {
-                'layout': 'flat-media-v1',
-                'text': message.message_text or '',
-                'source_chat_id': message.source_chat_id,
-                'source_chat_title': message.source_chat_title,
-                'telegram_message_id': message.telegram_message_id,
-                'sent_at': message.sent_at.isoformat() if message.sent_at else None,
-                'grouped_id': message.grouped_id,
-                'revision': message.media_revision,
-                'files': [
-                    {
-                        'media_id': media.media_id,
-                        'name': filenames[media.media_id],
-                        'original_name': media.file_name,
-                        'mime_type': media.mime_type,
-                        'size': media.file_size,
-                        'sha256': media.sha256,
-                        'source_message_id': media.source_telegram_message_id,
-                        'caption': media.caption,
-                    }
-                    for media in selected
-                ],
-                'skipped_files': [
-                    {'name': media.file_name, 'mime_type': media.mime_type}
-                    for media in medias
-                    if media.download_status == 'skipped'
-                ],
-            }
-            manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
-            fingerprint = hashlib.sha256(manifest_json.encode()).hexdigest()
-            dedupe_key = hashlib.sha256(
-                json.dumps([message_id, request.storage_id, target_path, fingerprint]).encode()
-            ).hexdigest()
-            existing = (
-                (await db.execute(select(TgArchiveTask).where(TgArchiveTask.dedupe_key == dedupe_key)))
-                .scalars()
-                .first()
-            )
-            if existing:
-                result.append(existing.task_id)
-                continue
-            task = TgArchiveTask(
-                dedupe_key=dedupe_key,
-                message_id=message_id,
-                media_revision=message.media_revision,
-                storage_id=request.storage_id,
-                target_path=target_path,
-                package_name='',
-                manifest_json=manifest_json,
-                status='queued',
-                create_by=username,
-            )
-            db.add(task)
-            await db.flush()
-            for file in manifest['files']:
-                db.add(
-                    TgArchiveItem(
-                        task_id=task.task_id,
-                        media_id=file['media_id'],
-                        file_name=file['name'],
-                        file_size=file['size'],
-                        sha256=file['sha256'],
-                        status='queued',
-                    )
-                )
-            result.append(task.task_id)
-        # Return copied IDs rather than ORM attributes after committing.
+                reserved.add(name.casefold())
+                files.append({
+                    'media_id': media.media_id, 'name': name,
+                    'size': media.file_size, 'sha256': media.sha256,
+                })
+            members.append({'message_id': message_id, 'media_revision': message.media_revision})
+        manifest_json = json.dumps(
+            {'layout': 'zip-v1', 'messages': members, 'files': files}, ensure_ascii=False, sort_keys=True,
+        )
+        dedupe_key = hashlib.sha256(json.dumps([
+            request.storage_id, target_path, request.archive_name, manifest_json,
+        ]).encode()).hexdigest()
+        existing = await db.scalar(select(TgArchiveTask.task_id).where(TgArchiveTask.dedupe_key == dedupe_key))
+        if existing:
+            await db.commit()
+            return [existing]
+        conflict = await db.scalar(select(TgArchiveTask.task_id).where(
+            TgArchiveTask.storage_id == request.storage_id,
+            TgArchiveTask.target_path == target_path,
+            TgArchiveTask.package_name == request.archive_name,
+            TgArchiveTask.archive_format == 'zip',
+        ).limit(1))
+        if conflict:
+            raise ServiceException(message='该目录已提交过不同内容的同名 ZIP，请修改压缩包名称')
+        task = TgArchiveTask(
+            dedupe_key=dedupe_key,
+            message_id=min(ids),
+            media_revision=next(member['media_revision'] for member in members if member['message_id'] == min(ids)),
+            storage_id=request.storage_id, target_path=target_path,
+            package_name=request.archive_name, archive_format='zip',
+            manifest_json=manifest_json, status='queued', create_by=username,
+        )
+        db.add(task)
+        await db.flush()
+        task_id = task.task_id
+        for member in members:
+            db.add(TgArchiveMessage(task_id=task_id, **member))
+        for file in files:
+            db.add(TgArchiveItem(
+                task_id=task_id, media_id=file['media_id'], file_name=file['name'],
+                file_size=file['size'], sha256=file['sha256'], status='queued',
+            ))
+        # Source items stay immutable; this output item records the one uploaded ZIP.
+        db.add(TgArchiveItem(
+            task_id=task_id, file_name=request.archive_name, file_size=0, sha256='', status='queued',
+        ))
         await db.commit()
-        return result
+        return [task_id]
 
     @staticmethod
     async def retry_archive(db: AsyncSession, task_id: int) -> None:
-        message_id = await db.scalar(select(TgArchiveTask.message_id).where(TgArchiveTask.task_id == task_id))
-        await db.scalar(select(TgMessage.message_id).where(TgMessage.message_id == message_id).with_for_update())
+        message_ids = select(TgArchiveMessage.message_id).where(TgArchiveMessage.task_id == task_id)
+        await db.execute(select(TgMessage.message_id).where(TgMessage.message_id.in_(message_ids))
+                         .order_by(TgMessage.message_id).with_for_update())
         medias = (
             await db.scalars(
                 select(TgMessageMedia)

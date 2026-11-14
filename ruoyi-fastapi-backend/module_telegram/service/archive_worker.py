@@ -8,25 +8,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, exists, or_, select, update
 
 from config.database import AsyncSessionLocal
 from config.env import ArchiveConfig
 from module_telegram.dao.telegram_dao import TelegramDao
-from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveTask
+from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveMessage, TgArchiveTask
 from module_telegram.entity.do.telegram_do import TgAccount, TgChat, TgForwardRecord, TgMessage, TgMessageMedia
 from module_telegram.service.archive_service import file_sha256, media_filename, message_media_filenames, private_path
 from module_telegram.service.archive_storage import ArchiveStorageError, child_path, get_storage
+from module_telegram.service.archive_zip import DiskSpaceError, build_media_zip
 from module_telegram.service.media_runtime import media_runtime, run_blocking
 from module_telegram.service.telegram_client_service import TelegramClientManager
 from module_telegram.service.telegram_rule_service import ListenerRulePolicy, TelegramStorageService
 from module_telegram.service.telegram_service import TelegramForwardService
 from utils.log_util import logger
-
-
-class DiskSpaceError(Exception):
-    pass
-
 
 PROGRESS_INTERVAL_SECONDS = 2
 CATCHUP_PAGE_SIZE = 200
@@ -76,6 +72,15 @@ class TelegramArchiveWorker:
             and_(state == ('downloading' if kind == 'download' else 'uploading'), model.lease_until < now),
         )
         async with AsyncSessionLocal() as db:
+            deleting = model.message_id.in_(
+                select(TgMessageMedia.message_id).where(TgMessageMedia.download_status == 'deleting')
+            )
+            if kind == 'archive':
+                deleting = exists().where(
+                    TgArchiveMessage.task_id == TgArchiveTask.task_id,
+                    TgMessageMedia.message_id == TgArchiveMessage.message_id,
+                    TgMessageMedia.download_status == 'deleting',
+                )
             candidate = (
                 await db.execute(
                     select(getattr(model, pk), model.message_id)
@@ -83,9 +88,7 @@ class TelegramArchiveWorker:
                     .where(
                         ready,
                         getattr(model, pk).not_in([job_id for (active_kind, job_id) in media_runtime.active if active_kind == kind]),
-                        model.message_id.not_in(
-                            select(TgMessageMedia.message_id).where(TgMessageMedia.download_status == 'deleting')
-                        ),
+                        ~deleting,
                     )
                     .order_by(getattr(model, pk))
                     .limit(1)
@@ -323,87 +326,142 @@ class TelegramArchiveWorker:
                 await db.commit()
 
     async def archive(self, job: dict[str, Any]) -> None:
-        with media_runtime.operation('archive', job['task_id'], job['message_id']):
-            async with AsyncSessionLocal() as db:
-                message = await db.get(TgMessage, job['message_id'])
-                if not message or message.is_sensitive == 'Y':
-                    raise ArchiveStorageError('来源消息不存在或已被敏感词拦截')
+        async with AsyncSessionLocal() as db:
+            message_ids = list(await db.scalars(
+                select(TgArchiveMessage.message_id).where(TgArchiveMessage.task_id == job['task_id'])
+            ))
+            messages = list(await db.scalars(select(TgMessage).where(TgMessage.message_id.in_(message_ids))))
+            if not message_ids or len(messages) != len(message_ids) or any(message.is_sensitive == 'Y' for message in messages):
+                raise ArchiveStorageError('来源消息不存在或已被敏感词拦截')
+        with media_runtime.operation('archive', job['task_id'], message_ids):
+            if job['archive_format'] == 'zip':
+                await self._archive_zip(job)
+            else:
+                await self._archive_files(job)
+
+    async def _archive_zip(self, job: dict[str, Any]) -> None:
+        async with AsyncSessionLocal() as db:
+            records = list(await db.scalars(
+                select(TgArchiveItem).where(TgArchiveItem.task_id == job['task_id']).order_by(TgArchiveItem.item_id)
+            ))
+            output = next((row_values(item) for item in records if item.media_id is None), None)
+            files = [row_values(item) for item in records if item.media_id is not None]
+            if not output or not files:
+                raise ArchiveStorageError('ZIP 归档清单不完整')
+            medias = {media.media_id: media for media in await db.scalars(
+                select(TgMessageMedia).where(TgMessageMedia.media_id.in_([file['media_id'] for file in files]))
+            )}
+            for file in files:
+                media = medias.get(file['media_id'])
+                if not media or media.download_status != 'ready' or not media.local_path:
+                    raise ArchiveStorageError('待打包的本地素材不可用，请重新下载后重试')
+                file['source'] = private_path(media.local_path)
+        workdir = private_path(f'.tasks/{job["task_id"]}')
+        package = workdir / output['file_name']
+        try:
+            await run_blocking(build_media_zip, package, files)
+            checksum = await run_blocking(file_sha256, package)
+            size = package.stat().st_size
             storage = await run_blocking(get_storage, job['storage_id'])
-            # Previously submitted tasks retain their recorded destination.
-            destination = child_path(job['target_path'], job['package_name']) if job['package_name'] else job['target_path']
-            await run_blocking(storage.ensure_dir, destination)
+            await run_blocking(storage.ensure_dir, job['target_path'])
+            remote = await run_blocking(storage.upload, package, job['target_path'], output['file_name'], checksum)
             async with AsyncSessionLocal() as db:
-                # Legacy pending sidecars are no longer generated or uploaded.
-                await db.execute(update(TgArchiveItem).where(
-                    TgArchiveItem.task_id == job['task_id'], TgArchiveItem.media_id.is_(None),
-                    TgArchiveItem.status != 'completed',
-                ).values(status='skipped', last_error=None))
-                items = [
-                    row_values(item)
-                    for item in (
-                        await db.execute(
-                            select(TgArchiveItem)
-                            .where(
-                                TgArchiveItem.task_id == job['task_id'], TgArchiveItem.status != 'completed',
-                                TgArchiveItem.media_id.is_not(None),
-                            )
-                            .order_by(TgArchiveItem.item_id)
-                        )
-                    ).scalars()
-                ]
+                task = await db.scalar(select(TgArchiveTask).where(
+                    TgArchiveTask.task_id == job['task_id'], TgArchiveTask.lease_token == job['lease_token'],
+                ).with_for_update())
+                if task is None:
+                    raise asyncio.CancelledError
+                await db.execute(update(TgArchiveItem).where(TgArchiveItem.task_id == job['task_id']).values(
+                    status='completed', last_error=None,
+                ))
+                await db.execute(update(TgArchiveItem).where(TgArchiveItem.item_id == output['item_id']).values(
+                    file_size=size, sha256=checksum, remote_id=remote,
+                ))
+                task.status, task.completed_at = 'completed', datetime.now()
+                task.lease_token = task.lease_until = task.next_retry_at = task.last_error = None
                 await db.commit()
-            for item in items:
-                async with AsyncSessionLocal() as db:
-                    media = await db.get(TgMessageMedia, item['media_id'])
-                    relative_path = media.local_path if media and media.download_status == 'ready' else ''
-                if not relative_path:
-                    raise ArchiveStorageError('待上传的本地素材不可用')
-                source = private_path(relative_path)
-                if (
-                    not source.is_file()
-                    or source.stat().st_size != item['file_size']
-                    or await run_blocking(file_sha256, source) != item['sha256']
-                ):
-                    raise ArchiveStorageError('本地文件已缺失或发生变化，归档已暂停')
-                try:
-                    remote = await run_blocking(storage.upload, source, destination, item['file_name'], item['sha256'])
-                except Exception as exc:
-                    async with AsyncSessionLocal() as db:
-                        await db.execute(
-                            update(TgArchiveItem)
-                            .where(TgArchiveItem.item_id == item['item_id'])
-                            .values(
-                                status='failed',
-                                last_error=str(exc)[:400] if isinstance(exc, ArchiveStorageError) else type(exc).__name__,
-                            )
+        finally:
+            # Also remove failed/interrupted attempts; retries rebuild deterministically.
+            await run_blocking(shutil.rmtree, workdir, True)
+
+    async def _archive_files(self, job: dict[str, Any]) -> None:
+        # Compatibility for tasks created before ZIP archives; no new submissions use this format.
+        storage = await run_blocking(get_storage, job['storage_id'])
+        # Previously submitted tasks retain their recorded destination.
+        destination = child_path(job['target_path'], job['package_name']) if job['package_name'] else job['target_path']
+        await run_blocking(storage.ensure_dir, destination)
+        async with AsyncSessionLocal() as db:
+            # Legacy pending sidecars are no longer generated or uploaded.
+            await db.execute(update(TgArchiveItem).where(
+                TgArchiveItem.task_id == job['task_id'], TgArchiveItem.media_id.is_(None),
+                TgArchiveItem.status != 'completed',
+            ).values(status='skipped', last_error=None))
+            items = [
+                row_values(item)
+                for item in (
+                    await db.execute(
+                        select(TgArchiveItem)
+                        .where(
+                            TgArchiveItem.task_id == job['task_id'], TgArchiveItem.status != 'completed',
+                            TgArchiveItem.media_id.is_not(None),
                         )
-                        await db.commit()
-                    raise
-                async with AsyncSessionLocal() as db:
-                    # Fence completion against an expired/stolen parent lease.
-                    task = await db.scalar(
-                        select(TgArchiveTask.task_id)
-                        .where(TgArchiveTask.task_id == job['task_id'], TgArchiveTask.lease_token == job['lease_token'])
-                        .with_for_update()
+                        .order_by(TgArchiveItem.item_id)
                     )
-                    if task is None:
-                        raise asyncio.CancelledError
+                ).scalars()
+            ]
+            await db.commit()
+        for item in items:
+            async with AsyncSessionLocal() as db:
+                media = await db.get(TgMessageMedia, item['media_id'])
+                relative_path = media.local_path if media and media.download_status == 'ready' else ''
+            if not relative_path:
+                raise ArchiveStorageError('待上传的本地素材不可用')
+            source = private_path(relative_path)
+            if (
+                not source.is_file()
+                or source.stat().st_size != item['file_size']
+                or await run_blocking(file_sha256, source) != item['sha256']
+            ):
+                raise ArchiveStorageError('本地文件已缺失或发生变化，归档已暂停')
+            try:
+                remote = await run_blocking(storage.upload, source, destination, item['file_name'], item['sha256'])
+            except Exception as exc:
+                async with AsyncSessionLocal() as db:
                     await db.execute(
                         update(TgArchiveItem)
                         .where(TgArchiveItem.item_id == item['item_id'])
-                        .values(status='completed', remote_id=remote, last_error=None)
+                        .values(
+                            status='failed',
+                            last_error=str(exc)[:400] if isinstance(exc, ArchiveStorageError) else type(exc).__name__,
+                        )
                     )
                     await db.commit()
-            await self._update(
-                'archive',
-                job,
-                status='completed',
-                completed_at=datetime.now(),
-                lease_token=None,
-                lease_until=None,
-                next_retry_at=None,
-                last_error=None,
-            )
+                raise
+            async with AsyncSessionLocal() as db:
+                # Fence completion against an expired/stolen parent lease.
+                task = await db.scalar(
+                    select(TgArchiveTask.task_id)
+                    .where(TgArchiveTask.task_id == job['task_id'], TgArchiveTask.lease_token == job['lease_token'])
+                    .with_for_update()
+                )
+                if task is None:
+                    raise asyncio.CancelledError
+                await db.execute(
+                    update(TgArchiveItem)
+                    .where(TgArchiveItem.item_id == item['item_id'])
+                    .values(status='completed', remote_id=remote, last_error=None)
+                )
+                await db.commit()
+        await self._update(
+            'archive',
+            job,
+            status='completed',
+            completed_at=datetime.now(),
+            lease_token=None,
+            lease_until=None,
+            next_retry_at=None,
+            last_error=None,
+        )
 
     async def _catchup_loop(self) -> None:
         while True:

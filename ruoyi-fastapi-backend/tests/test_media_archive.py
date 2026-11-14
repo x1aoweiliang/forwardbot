@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from zipfile import ZipFile
 
 import pytest
 from sqlalchemy import BigInteger, create_engine, func, inspect, select, update
@@ -22,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config.database import Base, create_async_session_local
 from config.env import ArchiveConfig
 from exceptions.exception import ServiceException
-from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveTask
+from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveMessage, TgArchiveTask
 from module_telegram.entity.do.telegram_do import (
     TgAccount,
     TgChat,
@@ -181,7 +182,7 @@ def test_sensitive_and_other_file_types_do_not_start_downloads(monkeypatch: pyte
             )
             with pytest.raises(ServiceException):
                 await TelegramArchiveService.submit(
-                    db, ArchiveSubmitModel(message_ids=[blocked], storage_id='test'), 'test'
+                    db, ArchiveSubmitModel(message_ids=[blocked], storage_id='test', archive_name='test'), 'test'
                 )
             document = source_message(11)
             document.photo = None
@@ -345,9 +346,8 @@ def test_expired_job_lease_can_be_reclaimed_but_old_worker_cannot_complete(
     asyncio.run(run())
 
 
-def test_archive_is_idempotent_and_retry_skips_completed_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_zip_archive_is_idempotent_and_retries_the_same_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     uploads = []
-    failed_once = False
 
     class Storage:
         def ensure_dir(self, path: str) -> str:
@@ -355,51 +355,49 @@ def test_archive_is_idempotent_and_retry_skips_completed_files(monkeypatch: pyte
             return path
 
         def upload(self, source: Path, directory: str, filename: str, checksum: str) -> str:
-            nonlocal failed_once
-            uploads.append(filename)
-            assert hashlib.sha256(source.read_bytes()).hexdigest() == checksum
-            if filename == '原文_02.jpg' and not failed_once:
-                failed_once = True
+            assert filename == 'test.zip' and directory == '旅行'
+            contents = source.read_bytes()
+            assert hashlib.sha256(contents).hexdigest() == checksum
+            with ZipFile(source) as package:
+                assert package.namelist() == ['原文_01.jpg', '原文_02.jpg']
+                assert package.testzip() is None
+                assert all(package.read(name) == b'abcdef' for name in package.namelist())
+            uploads.append(contents)
+            if len(uploads) == 1:
                 raise ArchiveStorageError('网络中断')
-            return f'remote/{filename}'
+            return 'remote/test.zip'
 
     async def run() -> None:
         async with database(monkeypatch, tmp_path) as sessions:
             monkeypatch.setattr('module_telegram.service.archive_worker.get_storage', lambda _id: Storage())
             async with sessions() as db:
                 message_id = await ingest(db, [source_message(10, grouped_id=777), source_message(11, '', 777)])
-                request = ArchiveSubmitModel(message_ids=[message_id], storage_id='test', target_path='旅行')
+                request = ArchiveSubmitModel(message_ids=[message_id], storage_id='test', archive_name='test', target_path='旅行')
                 with pytest.raises(ServiceException) as error:
                     await TelegramArchiveService.submit(db, request, 'operator')
                 assert '尚未全部下载' in error.value.message
                 await ready_media(db, message_id)
                 ids = await TelegramArchiveService.submit(db, request, 'operator')
                 assert await TelegramArchiveService.submit(db, request, 'operator') == ids
-                assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery()))['rows'][0][
-                    'archived'
-                ] is False
+                assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery()))['rows'][0]['archived'] is False
             worker = TelegramArchiveWorker()
             first = await worker.claim('archive')
             with pytest.raises(ArchiveStorageError) as error:
                 await worker.archive(first)
             await worker._failed('archive', first, error.value)
+            assert not private_path(f'.tasks/{ids[0]}').exists()
             async with sessions() as db:
-                assert (
-                    await db.scalar(
-                        select(func.count()).select_from(TgArchiveItem).where(TgArchiveItem.status == 'completed')
-                    )
-                    == 1
-                )
+                assert await db.scalar(select(func.count()).select_from(TgArchiveItem).where(TgArchiveItem.status == 'completed')) == 0
                 await TelegramArchiveService.retry_archive(db, ids[0])
             await worker.archive(await worker.claim('archive'))
             async with sessions() as db:
                 assert (await db.get(TgArchiveTask, ids[0])).status == 'completed'
-                assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='archived')))[
-                    'total'
-                ] == 1
-                assert (await TelegramArchiveService.detail(db, message_id))['archives'][0]['files']
-            assert uploads == ['原文_01.jpg', '原文_02.jpg', '原文_02.jpg']
-            assert not private_path('.tasks').exists()
+                assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='archived')))['total'] == 1
+                record = (await TelegramArchiveService.detail(db, message_id))['archives'][0]
+                assert record['files'] == [{'name': 'test.zip', 'status': 'completed', 'error': None}]
+                assert record['mediaCount'] == 2
+            assert len(uploads) == 2 and uploads[0] == uploads[1]
+            assert not private_path(f'.tasks/{ids[0]}').exists()
 
     asyncio.run(run())
 
@@ -415,33 +413,55 @@ def test_media_filename_uses_caption_and_safe_album_index(text: str, sequence: i
     assert len(media_filename(986, 'video/mp4', '第' * 500, 1).encode()) < 200
 
 
-def test_batch_archives_in_source_order_and_reserves_distinct_flat_names(
+def test_batch_zip_follows_source_order_and_marks_every_member_archived(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    uploads = []
+
+    class Storage:
+        def ensure_dir(self, path: str) -> str:
+            assert path == '飞机/20261114'
+            return path
+
+        def upload(self, source: Path, directory: str, filename: str, checksum: str) -> str:
+            with ZipFile(source) as package:
+                uploads.append(package.namelist())
+            assert filename == '剧名.zip' and directory == '飞机/20261114'
+            return filename
+
     async def run() -> None:
         async with database(monkeypatch, tmp_path) as sessions, sessions() as db:
-            # Ingest order differs from source order; selection order is deliberately reversed.
+            monkeypatch.setattr('module_telegram.service.archive_worker.get_storage', lambda _: Storage())
             last = await ingest(db, [source_message(30, '第二集')])
             first = await ingest(db, [source_message(10, '第一集')])
             second = await ingest(db, [source_message(20, '第一集')])
             for message_id in [last, first, second]:
                 await ready_media(db, message_id)
-            request = ArchiveSubmitModel(message_ids=[last, second, first], storage_id='test', target_path='剧集')
+            request = ArchiveSubmitModel(message_ids=[last, second, first], storage_id='test', archive_name='剧名', target_path='飞机/20261114')
+            # Responses must not touch expired ORM fields after commit.
+            db.sync_session.expire_on_commit = True
             ids = await TelegramArchiveService.submit(db, request, 'test')
-            tasks = list(await db.scalars(select(TgArchiveTask).order_by(TgArchiveTask.task_id)))
-            assert [task.message_id for task in tasks] == [first, second, last]
-            assert all(task.package_name == '' and task.target_path == '剧集' for task in tasks)
-            items = list(await db.scalars(select(TgArchiveItem).order_by(TgArchiveItem.item_id)))
-            assert len(items) == 3 and all(item.media_id is not None for item in items)
-            names = [item.file_name for item in items]
+            assert len(ids) == 1
+            assert await TelegramArchiveService.submit(db, request, 'test') == ids
+            task = await db.get(TgArchiveTask, ids[0])
+            assert task.package_name == '剧名.zip' and task.archive_format == 'zip'
+            assert len(list(await db.scalars(select(TgArchiveMessage)))) == 3
+            for member_id in [first, second, last]:
+                with pytest.raises(ServiceException):
+                    await TelegramArchiveService.cleanup_local(db, [member_id])
+                await db.rollback()
+                assert (await TelegramArchiveService.detail(db, member_id))['archives'][0]['taskId'] == ids[0]
+            await db.rollback()
+            worker = TelegramArchiveWorker()
+            await worker.archive(await worker.claim('archive'))
+            assert len(uploads) == 1
+            names = uploads[0]
             assert names[0] == '第一集.jpg' and names[2] == '第二集.jpg'
             assert names[1].startswith('第一集_20_') and len(set(names)) == 3
-            assert await TelegramArchiveService.submit(db, request, 'test') == ids
-            worker = TelegramArchiveWorker()
-            for expected in [first, second, last]:
-                job = await worker.claim('archive')
-                assert job['message_id'] == expected
-                await worker._update('archive', job, status='completed')
+            assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='archived')))['total'] == 3
+            for member_id in [first, second, last]:
+                assert (await TelegramArchiveService.detail(db, member_id))['archives'][0]['files'][0]['name'] == '剧名.zip'
+            assert (await TelegramArchiveService.cleanup_local(db, [first, second, last]))['freedBytes'] == 18
 
     asyncio.run(run())
 
@@ -453,7 +473,7 @@ def test_text_only_message_does_not_create_an_archive(monkeypatch: pytest.Monkey
             text.media = text.photo = None
             message_id = await ingest(db, [text])
             with pytest.raises(ServiceException) as error:
-                await TelegramArchiveService.submit(db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test')
+                await TelegramArchiveService.submit(db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test', archive_name='test'), 'test')
             assert '没有可归档' in error.value.message
             assert await db.scalar(select(func.count()).select_from(TgArchiveTask)) == 0
 
@@ -610,7 +630,7 @@ def test_late_album_media_marks_previous_archive_outdated(monkeypatch: pytest.Mo
             message_id = await ingest(db, [source_message(10, grouped_id=777)])
             await ready_media(db, message_id)
             ids = await TelegramArchiveService.submit(
-                db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'operator'
+                db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test', archive_name='test'), 'operator'
             )
             await db.execute(update(TgArchiveTask).where(TgArchiveTask.task_id == ids[0]).values(status='completed'))
             await db.commit()
@@ -752,7 +772,7 @@ def test_local_cleanup_preserves_text_archives_and_requires_explicit_restore(
             await ready_media(db, message_id)
             task_id = (
                 await TelegramArchiveService.submit(
-                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test'
+                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test', archive_name='test'), 'test'
                 )
             )[0]
             await db.execute(update(TgArchiveTask).values(status='completed'))
@@ -797,7 +817,7 @@ def test_cleanup_blocks_active_work_without_deleting_any_files(
                 )
             else:
                 await TelegramArchiveService.submit(
-                    db, ArchiveSubmitModel(message_ids=[second], storage_id='test'), 'test'
+                    db, ArchiveSubmitModel(message_ids=[second], storage_id='test', archive_name='test'), 'test'
                 )
                 await db.execute(update(TgArchiveTask).values(status=state))
             await db.commit()
@@ -886,7 +906,7 @@ def test_failed_archive_requires_missing_local_media_to_be_restored(
             await ready_media(db, message_id)
             task_id = (
                 await TelegramArchiveService.submit(
-                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test'
+                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test', archive_name='test'), 'test'
                 )
             )[0]
             await db.execute(update(TgArchiveTask).values(status='failed'))

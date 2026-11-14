@@ -146,7 +146,7 @@ docker compose --env-file deploy/archive/.env -f compose.archive.yml logs -f bac
 
 授权过期后在同一入口重新扫码，再重试失败任务。同一个存储 ID 只允许重新登录原账号，避免将已有归档任务误传到别人的网盘。确需切换账号时添加新的存储 ID。
 
-目录浏览使用 `kuake list` 的完整 JSON 清单，创建目录使用 `kuake create`，上传使用 `kuake upload`。每次检查业务成功字段，上传后再次读取目录核对文件名、数量和大小。远端校验没有逐字节读取云端内容；同目录同名且同大小的文件会在重试时复用，请勿手动替换这些文件。不同采集素材归档到同目录时，应用会为重名文件追加消息和素材 ID。
+目录浏览使用 `kuake list` 的完整 JSON 清单，创建目录使用 `kuake create`，上传使用 `kuake upload`。每次检查业务成功字段，上传后再次读取目录核对文件名、数量和大小。远端校验没有逐字节读取云端内容；同目录同名且同大小的文件会在重试时复用，请勿手动替换这些文件。ZIP 包内的重名素材会追加消息和素材 ID；同目录已提交过不同内容的同名 ZIP 时，需要换一个压缩包名称。
 
 可选 Docker 方案需将对应容器架构的 `kuake` 可执行文件安装到持久卷 `/opt/quark/kuake` 并设置执行权限，`cli_path` 对应填写该路径。扫码凭据随素材卷保存，不再使用旧 Node CLI 的授权卷。
 
@@ -168,16 +168,20 @@ docker compose --env-file deploy/archive/.env -f compose.archive.yml logs -f bac
 1. 在监听规则中选择多个来源群，开启「自动下载图片、视频」。新建规则默认只采集；如果同时开启转发，则还需填写目标群。
 2. 新消息的原文先入库，图片和视频进入下载队列；相册共用一条素材记录，保留每项 caption。敏感词拦截规则仍然有效，其他类型附件显示为「非图片或视频」。
 3. 在「素材库」查看下载状态、预览素材，按群、原文、下载状态或归档状态筛选。
-4. 选中含有已就绪媒体的消息，点击归档。夸克自动进入 `/飞机/YYYYMMDD`（按浏览器当天日期），目录缺失时创建；可以继续进入剧集子目录或新建目录。S3 从配置的根目录开始。图片、视频直接上传到选定目录，不再额外创建消息子目录。
-5. 在消息详情查看每个文件的上传结果。失败后重试只处理未完成文件；可以把同一消息归档到多个存储或不同目录。
+4. 单条或批量选择已下载完成的消息，点击归档，填写 ZIP 名称（例如剧名 `abc`，也可填写 `abc.zip`）。夸克自动进入 `/飞机/YYYYMMDD`（按浏览器当天日期），目录缺失时创建；可以选择其他目录或新建目录。S3 从配置的根目录开始。本次所选消息的图片和视频合成一个 ZIP 上传，例如 `/飞机/20261114/abc.zip`，不再额外创建消息子目录。
+5. 提交成功后自动清空跨页选择，也可随时点击「清除已选」。在任一成员消息的详情中查看共享的 ZIP 归档结果。失败后重试整个归档任务；可以把同一消息归档到多个存储、不同目录或不同名称的 ZIP。
 6. 使用行内或详情中的「清理本地」，也可勾选多条后点击「清理所选本地素材」。确认后删除本地图片、视频及下载残片，保留文字、来源信息、云端文件和归档记录。未归档消息会明确提醒；下载中或归档排队、上传、自动重试中的消息需等待任务结束后清理。
 7. 清理后显示「本地已清理」，不会被补采自动重新下载；需要时点击「重新下载」。源消息已被删除或失去访问权限时可能无法恢复。清理失败保留「清理中 / 待重试」及错误提示，修复磁盘权限后再次清理即可；重启后也可继续清理。
 
 文件优先使用自身 caption，没有 caption 时使用整条消息文字，完全没有文字时以源消息 ID 兜底。相册素材按源消息 ID 排序，加 `_01`、`_02` 等编号；文件名中的路径符号会替换，过长文字会截短。每条消息仍有独立的本地目录 `tg/账号ID/消息主键/`。
 
-批量归档按消息发送时间、Telegram 消息 ID 从早到晚提交，单个上传通道依序执行；失败重试会延后，不阻塞后续消息。归档时固定媒体清单，原文和来源信息留在数据库，不生成或上传 `message.txt`、`metadata.json`。只有文字的记录可查看但不能归档。晚到相册素材会增加版本，旧归档保留，素材列表重新显示待归档。
+每次单条或批量归档创建一个任务，ZIP 中按消息发送时间、Telegram 消息 ID 从早到晚写入素材；多个任务由单个上传通道依序执行。包内直接放素材文件，保留消息文字命名，不包含消息目录、`message.txt` 或 `metadata.json`。归档时固定成员版本、文件名及校验信息，原文和来源信息继续留在数据库。只有文字的记录可查看但不能归档。晚到相册素材会增加版本，旧归档保留，素材列表重新显示待归档，再归档时需使用新包名。
 
-历史归档记录仍显示其原来的目录和文件。升级前未完成的任务重试时保留原定目录，只继续处理媒体；新版任务的 `package_name` 为空。该字段目前为历史记录和旧任务兼容保留，旧任务结束且历史目录迁移后才可移除。
+ZIP 使用存储模式，不重新压缩已编码的视频，支持 ZIP64 大文件。打包和上传期间，该任务所有成员均不可清理。一次尝试结束后删除临时 ZIP，原始本地素材保留；重试或重启恢复时按固定清单重新打包，云端已存在的相同文件由存储适配器核验并复用。
+
+历史归档记录仍显示其原来的目录和文件。升级前未完成的任务保留 `archive_format=files`，重试时继续原来的逐文件上传；新任务使用 `archive_format=zip`，`package_name` 保存 ZIP 文件名。旧执行路径仍服务历史未完成任务，待这些任务不再需要重试后才可移除。
+
+从旧版本升级时先备份数据库、停止后端，再在 `ruoyi-fastapi-backend` 运行 `APP_ENV=prod ../.venv/bin/python -m alembic upgrade head`，最后更新前端并启动后端。新版本迁移到 `20261114_01`，增加归档成员表并补齐历史任务的成员关系，不新增数据库或 Redis。存在 ZIP 任务后不能直接回退表结构到旧版本。
 
 首次补采扫描只记录监控起点，不下载启用前的全部历史。随后每分钟根据持久化游标补采停机和断线期间遗漏的消息。恢复任务仍要求源消息存在、Telegram 账号仍有访问权限。
 
@@ -186,7 +190,7 @@ docker compose --env-file deploy/archive/.env -f compose.archive.yml logs -f bac
 - 素材保存在 `ARCHIVE_MEDIA_DIR` 指定的本机目录，默认是后端目录下的 `vf_admin/archive/media`；Docker 方案对应 `forwardbot-archive_media` 卷。该路径不挂到公开静态目录；预览需登录并具有 `tg:archive:list` 权限，由服务端签发绑定单个素材的短期链接。视频支持 Range 请求。
 - `tg:archive:write` 控制目录创建、归档提交、失败重试、夸克登录及本地清理。管理员可在角色管理中分配这两个权限。
 - 下载写入 `.part` 文件，按已有字节恢复；完整性检查后原子替换正式文件。任务状态、重试次数、租约、上传文件结果都保存在数据库。
-- 磁盘剩余空间不足时暂停并自动重试，`ARCHIVE_MIN_FREE_BYTES` 默认预留 256 MiB。应按视频量为素材卷预留容量。
+- 磁盘剩余空间不足时暂停并自动重试，`ARCHIVE_MIN_FREE_BYTES` 默认预留 256 MiB。打包期间额外需要约等于本次素材总大小的空间，加上少量 ZIP 目录开销和上述预留空间；临时文件位于素材目录 `.tasks/任务ID/`。
 - 原来的七天转发缓存清理只清理 `storage_kind=cache`。采集素材不会因为超过七天或完成上传被自动删除，由用户在素材库手动清理。清理允许取消尚未开始的下载队列，正在下载的文件会被阻止。
 - 源码服务正常停止或重启即可，保留 `vf_admin` 和配置的素材目录。使用 Docker 时停止服务不要附带 `-v` 删除数据卷。
 - 备份应同时覆盖数据库、素材目录、应用状态、夸克授权以及部署配置。恢复时使用同一份配套备份。
@@ -197,7 +201,7 @@ docker compose --env-file deploy/archive/.env -f compose.archive.yml logs -f bac
 
 ```bash
 cd ruoyi-fastapi-backend
-python -m pytest tests/test_telegram_services.py tests/test_media_archive.py tests/test_quark_archive.py tests/test_media_archive_regressions.py tests/test_forward_leases.py tests/test_delivery_pipeline.py -q
+python -m pytest tests/test_telegram_services.py tests/test_media_archive.py tests/test_quark_archive.py tests/test_media_archive_regressions.py tests/test_forward_leases.py tests/test_delivery_pipeline.py tests/test_zip_archive.py -q
 cd ../ruoyi-fastapi-frontend
 npm install
 npm run build:prod

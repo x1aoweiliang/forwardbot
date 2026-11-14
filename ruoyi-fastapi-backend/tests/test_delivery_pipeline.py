@@ -358,9 +358,11 @@ def test_cancelled_upload_keeps_ownership_until_real_operation_exits(
         async with database(monkeypatch, tmp_path) as sessions:
             async with sessions() as db:
                 message_id = await ingest(db, [source_message()])
+                second_id = await ingest(db, [source_message(11, '第二集')])
                 await ready_media(db, message_id)
+                await ready_media(db, second_id)
                 await TelegramArchiveService.submit(
-                    db, ArchiveSubmitModel(message_ids=[message_id], storage_id='test'), 'test'
+                    db, ArchiveSubmitModel(message_ids=[message_id, second_id], storage_id='test', archive_name='test'), 'test'
                 )
             worker = TelegramArchiveWorker()
             job = await worker.claim('archive')
@@ -379,12 +381,12 @@ def test_cancelled_upload_keeps_ownership_until_real_operation_exits(
                 await asyncio.wait_for(failed.wait(), 2)
                 sending.cancel()  # A second cancellation must not detach the thread.
                 await asyncio.sleep(0)
-                assert not sending.done() and media_runtime.busy(message_id)
+                assert not sending.done() and media_runtime.busy(message_id) and media_runtime.busy(second_id)
                 assert await TelegramArchiveWorker().claim('archive') is None
                 async with sessions() as db:
                     with pytest.raises(ServiceException):
-                        await TelegramArchiveService.cleanup_local(db, [message_id])
-                assert uploads == ['原文.jpg']
+                        await TelegramArchiveService.cleanup_local(db, [second_id])
+                assert uploads == ['test.zip']
             finally:
                 release.set()
                 await asyncio.gather(sending, return_exceptions=True)

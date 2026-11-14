@@ -13,18 +13,19 @@ from exceptions.exception import ServiceException
 
 class MediaRuntime:
     def __init__(self) -> None:
-        self.active: dict[tuple[str, int], int] = {}
+        self.active: dict[tuple[str, int], frozenset[int]] = {}
         self.deleting: set[int] = set()
 
     def busy(self, message_id: int) -> bool:
-        return message_id in self.active.values() or message_id in self.deleting
+        return any(message_id in ids for ids in self.active.values()) or message_id in self.deleting
 
     @contextmanager
-    def operation(self, kind: str, job_id: int, message_id: int) -> Any:
+    def operation(self, kind: str, job_id: int, message_id: int | list[int]) -> Any:
         key = (kind, job_id)
-        if key in self.active or message_id in self.deleting:
+        ids = frozenset([message_id] if isinstance(message_id, int) else message_id)
+        if key in self.active or ids & self.deleting:
             raise ServiceException(message='素材任务仍在执行或清理中')
-        self.active[key] = message_id
+        self.active[key] = ids
         try:
             yield
         finally:

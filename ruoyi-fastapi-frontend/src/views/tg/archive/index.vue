@@ -71,12 +71,13 @@
         <h3>归档记录</h3>
         <el-empty v-if="!detail.archives.length" description="尚未归档" :image-size="70" />
         <article v-for="task in detail.archives" :key="task.taskId" class="archive-record">
-          <div class="record-heading"><strong>{{ storageName(task.storageId) }}</strong><el-tag :type="tagType(task.status)">{{ label(task.status) }}</el-tag></div>
+          <div class="record-heading"><strong>{{ storageName(task.storageId) }}</strong><el-tag :type="tagType(task.status)">{{ task.archiveFormat === 'zip' && task.status === 'uploading' ? '打包 / 上传中' : label(task.status) }}</el-tag></div>
           <p class="archive-path">/{{ [task.targetPath, task.packageName].filter(Boolean).join('/') }}</p>
+          <p v-if="task.archiveFormat === 'zip'">ZIP 压缩包 · 共 {{ task.mediaCount }} 个素材</p>
           <small v-if="task.mediaRevision !== detail.mediaRevision">这份归档之后有新素材到达，可以再次归档完整消息。</small>
           <div v-for="file in task.files" :key="file.name" class="archive-file"><span>{{ file.name }}</span><span>{{ label(file.status) }}</span></div>
           <p v-if="task.lastError" class="error-text">{{ task.lastError }}</p>
-          <el-button v-if="['failed', 'retry'].includes(task.status)" v-hasPermi="['tg:archive:write']" link type="primary" @click="retryArchive(task.taskId)">重试未完成文件</el-button>
+          <el-button v-if="['failed', 'retry'].includes(task.status)" v-hasPermi="['tg:archive:write']" link type="primary" @click="retryArchive(task.taskId)">重试归档</el-button>
         </article>
       </div>
     </el-drawer>
@@ -96,8 +97,13 @@
     </el-dialog>
 
     <el-dialog v-model="archiveOpen" title="归档素材" width="620px" :close-on-click-modal="false">
-      <p>将 {{ archiveIds.length }} 条消息的图片和视频按消息从早到晚直接上传到所选目录，文件以消息文字命名。原文保留在素材库中。</p>
+      <p>将 {{ archiveIds.length }} 条消息的图片和视频按消息从早到晚放入同一个 ZIP，再上传到所选目录。包内保留素材文件名，原文保留在素材库中。</p>
       <el-form label-position="top">
+        <el-form-item label="ZIP 压缩包名称" required>
+          <el-input v-model="archiveForm.archiveName" :disabled="submitting" placeholder="填写剧名，例如 abc" maxlength="180" @keyup.enter="submitArchive">
+            <template #append>.zip</template>
+          </el-input>
+        </el-form-item>
         <el-form-item label="存储位置"><el-select v-model="archiveForm.storageId" :disabled="preparingArchive || creatingFolder || submitting || foldersLoading" placeholder="选择夸克或 S3" style="width:100%" @change="changeStorage">
           <el-option v-for="storage in storageOptions" :key="storage.id" :label="`${storage.name} · ${storage.type === 'quark' ? '夸克' : 'S3'}`" :value="storage.id" />
         </el-select></el-form-item>
@@ -111,9 +117,9 @@
           <el-empty v-if="!folderOptions.length && !foldersLoading" description="当前目录没有子文件夹，可以直接归档到这里。" :image-size="65" />
         </div>
         <el-alert v-if="folderError" :title="folderError" type="error" :closable="false" />
-        <p class="destination">归档到：{{ storageName(archiveForm.storageId) }} /{{ folderPath }}</p>
+        <p class="destination">归档到：{{ storageName(archiveForm.storageId) }} /{{ [folderPath, zipFileName || '压缩包名称.zip'].filter(Boolean).join('/') }}</p>
       </template>
-      <template #footer><el-button @click="archiveOpen = false">取消</el-button><el-button type="primary" :loading="submitting" :disabled="preparingArchive || creatingFolder || !archiveForm.storageId || foldersLoading || !!folderError" @click="submitArchive">开始归档</el-button></template>
+      <template #footer><el-button @click="archiveOpen = false">取消</el-button><el-button type="primary" :loading="submitting" :disabled="preparingArchive || creatingFolder || !archiveForm.storageId || !zipFileName || foldersLoading || !!folderError" @click="submitArchive">打包并归档</el-button></template>
     </el-dialog>
   </div>
 </template>
@@ -127,7 +133,11 @@ const rows = ref([]), total = ref(0), selected = ref([]), loading = ref(false);
 const accounts = ref([]), chats = ref([]), storageOptions = ref([]);
 const query = reactive({ pageNum: 1, pageSize: 20, state: undefined, keyword: '', accountId: undefined, sourceChatPk: undefined });
 const detailOpen = ref(false), detailLoading = ref(false), detail = ref(null), previewUrls = reactive({});
-const archiveOpen = ref(false), archiveIds = ref([]), archiveForm = reactive({ storageId: '' });
+const archiveOpen = ref(false), archiveIds = ref([]), archiveForm = reactive({ storageId: '', archiveName: '' });
+const zipFileName = computed(() => {
+  const name = archiveForm.archiveName.trim().replace(/\.zip$/i, '').trim();
+  return name ? `${name}.zip` : '';
+});
 const folderPath = ref(''), folderOptions = ref([]), foldersLoading = ref(false), folderError = ref('');
 const newFolderOpen = ref(false), newFolderName = ref(''), creatingFolder = ref(false), submitting = ref(false), preparingArchive = ref(false);
 const quarkOpen = ref(false), quarkStorageId = ref(''), quarkStatus = ref({}), quarkLoading = ref(false), quarkError = ref(''), qrImage = ref('');
@@ -246,6 +256,7 @@ async function pollQuark(sequence) {
   } catch (error) { if (sequence === quarkSequence) { cancelQr(); quarkError.value = error.message || '登录验证失败，请重新扫码'; } }
 }
 async function openArchive(messages) {
+  archiveForm.archiveName = '';
   archiveIds.value = messages.map(item => item.messageId); preparingArchive.value = true; archiveOpen.value = true;
   folderPath.value = ''; folderOptions.value = []; newFolderOpen.value = false; newFolderName.value = ''; folderError.value = '';
   try {
@@ -287,9 +298,11 @@ async function createFolder() {
   finally { creatingFolder.value = false; }
 }
 async function submitArchive() {
+  if (submitting.value || preparingArchive.value || creatingFolder.value || foldersLoading.value || folderError.value || !archiveForm.storageId) return;
+  if (!zipFileName.value) { proxy.$modal.msgWarning('请填写 ZIP 压缩包名称'); return; }
   submitting.value = true;
   try {
-    const result = await archiveApi.submit({ messageIds: archiveIds.value, storageId: archiveForm.storageId, targetPath: folderPath.value });
+    const result = await archiveApi.submit({ messageIds: archiveIds.value, storageId: archiveForm.storageId, targetPath: folderPath.value, archiveName: zipFileName.value });
     clearSelection();
     proxy.$modal.msgSuccess(result.msg); archiveOpen.value = false;
     await Promise.all([refresh(true), refreshDetail()]);
