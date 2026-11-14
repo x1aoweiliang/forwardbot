@@ -169,6 +169,7 @@ class TgMessage(Base):
     collected = Column(CHAR(1), nullable=False, server_default='N', index=True)
     media_revision = Column(Integer, nullable=False, server_default='1')
     message_text = Column(Text, nullable=True, comment='消息文本')
+    media_name = Column(String(200), nullable=True, comment='手动设置的素材名称，空值使用消息文字')
     sent_at = Column(DateTime, nullable=True, comment='Telegram发送时间')
     is_sensitive = Column(CHAR(1), nullable=False, server_default='N', comment='是否命中敏感词')
     sensitive_word = Column(String(255), nullable=True, comment='命中的敏感词')

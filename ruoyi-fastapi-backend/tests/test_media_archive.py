@@ -387,16 +387,31 @@ def test_zip_archive_is_idempotent_and_retries_the_same_package(monkeypatch: pyt
             await worker._failed('archive', first, error.value)
             assert not private_path(f'.tasks/{ids[0]}').exists()
             async with sessions() as db:
+                task = await db.get(TgArchiveTask, ids[0])
+                package = private_path(task.local_path)
+                assert package.is_file() and task.source_cleanup == 'pending'
+                assert all(media.download_status == 'ready' for media in await db.scalars(select(TgMessageMedia)))
                 assert await db.scalar(select(func.count()).select_from(TgArchiveItem).where(TgArchiveItem.status == 'completed')) == 0
                 await TelegramArchiveService.retry_archive(db, ids[0])
+
+            def must_reuse_zip(*args: Any) -> None:
+                pytest.fail('A complete retained ZIP must be reused, not rebuilt')
+
+            monkeypatch.setattr('module_telegram.service.archive_worker.build_media_zip', must_reuse_zip)
             await worker.archive(await worker.claim('archive'))
             async with sessions() as db:
-                assert (await db.get(TgArchiveTask, ids[0])).status == 'completed'
+                task = await db.get(TgArchiveTask, ids[0])
+                assert task.status == 'completed' and task.source_cleanup == 'completed'
+                assert all(media.download_status == 'deleted' for media in await db.scalars(select(TgMessageMedia)))
+                assert package.is_file()
                 assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='archived')))['total'] == 1
                 record = (await TelegramArchiveService.detail(db, message_id))['archives'][0]
                 assert record['files'] == [{'name': 'test.zip', 'status': 'completed', 'error': None}]
                 assert record['mediaCount'] == 2
-            assert len(uploads) == 2 and uploads[0] == uploads[1]
+                assert record['localZipAvailable'] is True
+                await TelegramArchiveService.retry_archive(db, ids[0])
+            await TelegramArchiveWorker().archive(await worker.claim('archive'))
+            assert len(uploads) == 3 and uploads[0] == uploads[1] == uploads[2]
             assert not private_path(f'.tasks/{ids[0]}').exists()
 
     asyncio.run(run())
@@ -461,7 +476,8 @@ def test_batch_zip_follows_source_order_and_marks_every_member_archived(
             assert (await TelegramArchiveService.list_library(db, ArchiveLibraryQuery(state='archived')))['total'] == 3
             for member_id in [first, second, last]:
                 assert (await TelegramArchiveService.detail(db, member_id))['archives'][0]['files'][0]['name'] == '剧名.zip'
-            assert (await TelegramArchiveService.cleanup_local(db, [first, second, last]))['freedBytes'] == 18
+            assert (await TelegramArchiveService.cleanup_local(db, [first, second, last]))['freedBytes'] == 0
+            assert all(media.download_status == 'deleted' for media in await db.scalars(select(TgMessageMedia)))
 
     asyncio.run(run())
 
@@ -669,7 +685,8 @@ def test_preview_http_requires_permission_and_supports_range(monkeypatch: pytest
                     yield db
 
             async def get_user(request: Request, token: str, db: Any) -> Any:
-                user = SimpleNamespace(permissions=['tg:archive:list'] if token == 'Bearer reader' else [])
+                permissions = {'Bearer reader': ['tg:archive:list'], 'Bearer writer': ['tg:archive:write']}
+                user = SimpleNamespace(permissions=permissions.get(token, []))
                 RequestContext.set_current_user(user)
                 return user
 
@@ -684,6 +701,7 @@ def test_preview_http_requires_permission_and_supports_range(monkeypatch: pytest
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
                 assert (await client.get('/telegram/archive/library')).status_code == 403
                 for method, url, body in (
+                    ('put', f'/telegram/archive/message/{message_id}/name', {'mediaName': '第一集'}),
                     ('post', '/telegram/archive/local/cleanup', {'messageIds': [message_id]}),
                     ('post', '/telegram/archive/quark/quark/login', {}),
                     ('get', '/telegram/archive/quark/quark/status', None),
@@ -692,6 +710,14 @@ def test_preview_http_requires_permission_and_supports_range(monkeypatch: pytest
                         method, url, json=body, headers={'Authorization': 'Bearer reader'}
                     )
                     assert denied_response.status_code == 403
+
+                renamed = await client.put(
+                    f'/telegram/archive/message/{message_id}/name', json={'mediaName': '第一集'},
+                    headers={'Authorization': 'Bearer writer'},
+                )
+                assert renamed.status_code == 200
+                async with sessions() as db:
+                    assert (await db.get(TgMessage, message_id)).media_name == '第一集'
 
                 assert (
                     await client.get(

@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import jwt
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.env import ArchiveConfig, JwtConfig
 from exceptions.exception import ServiceException
 from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveMessage, TgArchiveTask
 from module_telegram.entity.do.telegram_do import TgForwardRecord, TgMessage, TgMessageMedia
-from module_telegram.entity.vo.archive_vo import ArchiveLibraryQuery, ArchiveSubmitModel
+from module_telegram.entity.vo.archive_vo import ArchiveLibraryQuery, ArchiveSubmitModel, MediaRenameModel
 from module_telegram.service.archive_storage import load_storages, normalize_path
 from module_telegram.service.media_runtime import media_runtime
 from utils.common_util import CamelCaseUtil
@@ -58,7 +58,7 @@ def message_media_filenames(message: TgMessage, medias: list[TgMessageMedia]) ->
     return {
         media.media_id: media_filename(
             media.source_telegram_message_id, media.mime_type,
-            (media.caption or '').strip() or message.message_text,
+            message.media_name or (media.caption or '').strip() or message.message_text,
             index if len(files) > 1 else None,
         )
         for index, media in enumerate(files, 1)
@@ -99,7 +99,10 @@ class TelegramArchiveService:
         if query.source_chat_pk:
             filters.append(TgMessage.source_chat_pk == query.source_chat_pk)
         if query.keyword:
-            filters.append(TgMessage.message_text.contains(query.keyword, autoescape=True))
+            filters.append(or_(
+                TgMessage.message_text.contains(query.keyword, autoescape=True),
+                TgMessage.media_name.contains(query.keyword, autoescape=True),
+            ))
         pending = exists().where(
             TgMessageMedia.message_id == TgMessage.message_id,
             TgMessageMedia.download_status.in_(['queued', 'downloading', 'retry']),
@@ -174,6 +177,7 @@ class TelegramArchiveService:
                 readyCount=sum(file.download_status == 'ready' for file in files),
                 totalBytes=sum(file.file_size or 0 for file in files),
                 downloadedBytes=sum(file.downloaded_bytes or 0 for file in files),
+                mediaNames=list(message_media_filenames(message, files).values()),
             )
             rows.append(row)
         return {'rows': rows, 'total': total, 'pageNum': query.page_num, 'pageSize': query.page_size}
@@ -238,6 +242,9 @@ class TelegramArchiveService:
                 'targetPath': task.target_path,
                 'packageName': task.package_name,
                 'archiveFormat': task.archive_format,
+                'localZipAvailable': bool(task.local_path and private_path(task.local_path).is_file()),
+                'sourceCleanup': task.source_cleanup,
+                'cleanupError': task.cleanup_error,
                 'status': task.status,
                 'lastError': task.last_error,
                 'mediaRevision': revisions[task.task_id],
@@ -258,6 +265,24 @@ class TelegramArchiveService:
             for task in tasks
         ]
         return data
+
+    @staticmethod
+    async def rename_media(db: AsyncSession, message_id: int, request: MediaRenameModel) -> None:
+        message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
+        if not message or message.collected != 'Y':
+            raise ServiceException(message='采集记录不存在')
+        active = await db.scalar(select(TgArchiveTask.task_id)
+            .join(TgArchiveMessage, TgArchiveMessage.task_id == TgArchiveTask.task_id)
+            .where(TgArchiveMessage.message_id == message_id, TgArchiveTask.status.in_(['queued', 'uploading', 'retry']))
+            .limit(1))
+        if active or media_runtime.busy(message_id):
+            raise ServiceException(message='素材正在处理，请等当前下载或归档完成后改名')
+        name = request.media_name or None
+        if message.media_name != name:
+            message.media_name = name
+            message.media_revision += 1
+            message.update_time = datetime.now()
+        await db.commit()
 
     @staticmethod
     async def retry_download(db: AsyncSession, message_id: int) -> int:
@@ -284,21 +309,39 @@ class TelegramArchiveService:
         return count
 
     @staticmethod
-    async def cleanup_local(db: AsyncSession, message_ids: list[int]) -> dict[str, Any]:  # noqa: PLR0912
+    async def cleanup_local(  # noqa: PLR0912, PLR0915
+        db: AsyncSession, message_ids: list[int], *, archive_task_id: int | None = None,
+    ) -> dict[str, Any]:
         ids = sorted(set(message_ids))
+        archived_files = None
+        if archive_task_id is not None:
+            task = await db.get(TgArchiveTask, archive_task_id)
+            output = await db.scalar(select(TgArchiveItem).where(
+                TgArchiveItem.task_id == archive_task_id, TgArchiveItem.media_id.is_(None),
+            ))
+            if not task or task.status != 'completed' or task.source_cleanup != 'pending' or not task.local_path or not output:
+                raise ServiceException(message='ZIP 尚未上传完成或未安排原素材清理')
+            package = private_path(task.local_path)
+            if not package.is_file() or package.stat().st_size != output.file_size:
+                raise ServiceException(message='保留的本地 ZIP 缺失或大小发生变化，已暂停原素材清理')
+            archived_files = {
+                item.media_id: (item.file_size, item.sha256)
+                for item in await db.scalars(select(TgArchiveItem).where(
+                    TgArchiveItem.task_id == archive_task_id, TgArchiveItem.media_id.is_not(None),
+                ))
+            }
         with media_runtime.cleanup(ids):
             selected = []
             for message_id in ids:
                 message = await db.scalar(select(TgMessage).where(TgMessage.message_id == message_id).with_for_update())
                 if not message or message.collected != 'Y':
                     raise ServiceException(message=f'采集记录 {message_id} 不存在')
-                active_forward = await db.scalar(
-                    select(TgForwardRecord.record_id).where(
-                        TgForwardRecord.message_id == message_id,
-                        TgForwardRecord.status == 'sending',
-                        TgForwardRecord.lease_until > datetime.now(),
-                    ).limit(1)
-                )
+                forward_query = select(TgForwardRecord.record_id).where(TgForwardRecord.message_id == message_id)
+                if archived_files is not None:
+                    forward_query = forward_query.where(TgForwardRecord.status.in_(['queued', 'waiting_download', 'sending']))
+                else:
+                    forward_query = forward_query.where(TgForwardRecord.status == 'sending', TgForwardRecord.lease_until > datetime.now())
+                active_forward = await db.scalar(forward_query.limit(1))
                 if active_forward:
                     raise ServiceException(message=f'消息 {message_id} 正在补发，暂不能清理本地素材')
                 medias = (
@@ -314,7 +357,11 @@ class TelegramArchiveService:
                     .join(TgArchiveMessage, TgArchiveMessage.task_id == TgArchiveTask.task_id)
                     .where(
                         TgArchiveMessage.message_id == message_id,
-                        TgArchiveTask.status.in_(['queued', 'uploading', 'retry']),
+                        or_(
+                            TgArchiveTask.status.in_(['queued', 'uploading', 'retry']),
+                            (TgArchiveTask.status == 'failed') & (TgArchiveTask.local_path == '')
+                            if archived_files is not None else False,
+                        ),
                     )
                     .with_for_update(of=TgArchiveTask)
                     .limit(1)
@@ -322,8 +369,15 @@ class TelegramArchiveService:
                 if active_task or any(media.download_status == 'downloading' for media in medias):
                     raise ServiceException(message=f'消息 {message_id} 正在下载或等待归档完成，暂不能清理')
                 for media in medias:
+                    if archived_files is not None and media.media_id not in archived_files:
+                        continue
                     if media.storage_kind != 'archive' or media.download_status in {'skipped', 'disabled', 'deleted'}:
                         continue
+                    if archived_files is not None and (
+                        media.download_status not in {'ready', 'deleting'}
+                        or archived_files[media.media_id] != (media.file_size, media.sha256)
+                    ):
+                        raise ServiceException(message='原素材与 ZIP 清单不一致，已暂停自动清理')
                     paths = cleanup_paths(message.account_id, message_id, media)
                     selected.append((message_id, media.media_id, paths))
                     media.download_status = 'deleting'
@@ -439,6 +493,7 @@ class TelegramArchiveService:
             media_revision=next(member['media_revision'] for member in members if member['message_id'] == min(ids)),
             storage_id=request.storage_id, target_path=target_path,
             package_name=request.archive_name, archive_format='zip',
+            source_cleanup='pending',
             manifest_json=manifest_json, status='queued', create_by=username,
         )
         db.add(task)
@@ -463,6 +518,10 @@ class TelegramArchiveService:
         message_ids = select(TgArchiveMessage.message_id).where(TgArchiveMessage.task_id == task_id)
         await db.execute(select(TgMessage.message_id).where(TgMessage.message_id.in_(message_ids))
                          .order_by(TgMessage.message_id).with_for_update())
+        task = await db.get(TgArchiveTask, task_id)
+        retained_zip = bool(task and task.archive_format == 'zip' and task.local_path and private_path(task.local_path).is_file())
+        if task and task.status == 'completed' and not retained_zip:
+            raise ServiceException(message='没有保留的本地 ZIP，无法直接重新上传')
         medias = (
             await db.scalars(
                 select(TgMessageMedia)
@@ -471,15 +530,17 @@ class TelegramArchiveService:
                 .with_for_update()
             )
         ).all()
-        if any(
+        if not retained_zip and any(
             media.download_status != 'ready' or not media.local_path or not private_path(media.local_path).is_file()
             for media in medias
         ):
             raise ServiceException(message='本地素材尚未就绪，请先重新下载再重试归档')
         result = await db.execute(
             update(TgArchiveTask)
-            .where(TgArchiveTask.task_id == task_id, TgArchiveTask.status.in_(['failed', 'retry']))
-            .values(status='queued', attempts=0, next_retry_at=None, last_error=None)
+            .where(TgArchiveTask.task_id == task_id, TgArchiveTask.status.in_(
+                ['failed', 'retry', 'completed'] if retained_zip else ['failed', 'retry'],
+            ))
+            .values(status='queued', attempts=0, next_retry_at=None, last_error=None, completed_at=None)
         )
         if result.rowcount != 1:
             raise ServiceException(message='该归档任务当前不可重试')

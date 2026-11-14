@@ -15,7 +15,13 @@ from config.env import ArchiveConfig
 from module_telegram.dao.telegram_dao import TelegramDao
 from module_telegram.entity.do.archive_do import TgArchiveItem, TgArchiveMessage, TgArchiveTask
 from module_telegram.entity.do.telegram_do import TgAccount, TgChat, TgForwardRecord, TgMessage, TgMessageMedia
-from module_telegram.service.archive_service import file_sha256, media_filename, message_media_filenames, private_path
+from module_telegram.service.archive_service import (
+    TelegramArchiveService,
+    file_sha256,
+    media_filename,
+    message_media_filenames,
+    private_path,
+)
 from module_telegram.service.archive_storage import ArchiveStorageError, child_path, get_storage
 from module_telegram.service.archive_zip import DiskSpaceError, build_media_zip
 from module_telegram.service.media_runtime import media_runtime, run_blocking
@@ -166,6 +172,8 @@ class TelegramArchiveWorker:
     async def _loop(self, kind: str) -> None:
         while True:
             try:
+                if kind == 'archive':
+                    await self.cleanup_archives()
                 job = await self.claim(kind)
                 if not job:
                     await asyncio.sleep(ArchiveConfig.archive_poll_seconds)
@@ -338,6 +346,32 @@ class TelegramArchiveWorker:
                 await self._archive_zip(job)
             else:
                 await self._archive_files(job)
+        await self.cleanup_archives()
+
+    async def cleanup_archives(self) -> None:
+        async with AsyncSessionLocal() as db:
+            task_ids = list(await db.scalars(select(TgArchiveTask.task_id).where(
+                TgArchiveTask.status == 'completed', TgArchiveTask.source_cleanup == 'pending',
+                or_(TgArchiveTask.next_retry_at.is_(None), TgArchiveTask.next_retry_at <= datetime.now()),
+            ).order_by(TgArchiveTask.task_id)))
+        for task_id in task_ids:
+            async with AsyncSessionLocal() as db:
+                try:
+                    message_ids = list(await db.scalars(select(TgArchiveMessage.message_id).where(
+                        TgArchiveMessage.task_id == task_id,
+                    )))
+                    result = await TelegramArchiveService.cleanup_local(db, message_ids, archive_task_id=task_id)
+                    error = '部分原素材清理失败，将自动重试' if result['errors'] else None
+                except Exception as exc:
+                    await db.rollback()
+                    error = getattr(exc, 'message', None) or '原素材暂不能清理，将自动重试'
+                await db.execute(update(TgArchiveTask).where(
+                    TgArchiveTask.task_id == task_id, TgArchiveTask.source_cleanup == 'pending',
+                ).values(
+                    source_cleanup='pending' if error else 'completed', cleanup_error=error,
+                    next_retry_at=datetime.now() + timedelta(seconds=60) if error else None,
+                ))
+                await db.commit()
 
     async def _archive_zip(self, job: dict[str, Any]) -> None:
         async with AsyncSessionLocal() as db:
@@ -348,19 +382,43 @@ class TelegramArchiveWorker:
             files = [row_values(item) for item in records if item.media_id is not None]
             if not output or not files:
                 raise ArchiveStorageError('ZIP 归档清单不完整')
-            medias = {media.media_id: media for media in await db.scalars(
-                select(TgMessageMedia).where(TgMessageMedia.media_id.in_([file['media_id'] for file in files]))
-            )}
-            for file in files:
-                media = medias.get(file['media_id'])
-                if not media or media.download_status != 'ready' or not media.local_path:
-                    raise ArchiveStorageError('待打包的本地素材不可用，请重新下载后重试')
-                file['source'] = private_path(media.local_path)
         workdir = private_path(f'.tasks/{job["task_id"]}')
-        package = workdir / output['file_name']
+        relative_path = job['local_path'] or f'zips/{job["task_id"]}/{output["file_name"]}'
+        package = private_path(relative_path)
         try:
-            await run_blocking(build_media_zip, package, files)
-            checksum = await run_blocking(file_sha256, package)
+            reusable = bool(
+                job['local_path'] and package.is_file() and package.stat().st_size == output['file_size']
+                and await run_blocking(file_sha256, package) == output['sha256']
+            )
+            if not reusable:
+                async with AsyncSessionLocal() as db:
+                    medias = {media.media_id: media for media in await db.scalars(
+                        select(TgMessageMedia).where(TgMessageMedia.media_id.in_([file['media_id'] for file in files]))
+                    )}
+                    for file in files:
+                        media = medias.get(file['media_id'])
+                        if not media or media.download_status != 'ready' or not media.local_path:
+                            raise ArchiveStorageError('本地 ZIP 和原素材不可用，请重新下载后重试')
+                        file['source'] = private_path(media.local_path)
+                # An interrupted, unrecorded package can be rebuilt while originals still exist.
+                package.unlink(missing_ok=True)
+                temporary = workdir / output['file_name']
+                await run_blocking(build_media_zip, temporary, files)
+                checksum = await run_blocking(file_sha256, temporary)
+                package.parent.mkdir(parents=True, exist_ok=True)
+                temporary.replace(package)
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(update(TgArchiveTask).where(
+                        TgArchiveTask.task_id == job['task_id'], TgArchiveTask.lease_token == job['lease_token'],
+                    ).values(local_path=relative_path))
+                    if result.rowcount != 1:
+                        raise asyncio.CancelledError
+                    await db.execute(update(TgArchiveItem).where(TgArchiveItem.item_id == output['item_id']).values(
+                        file_size=package.stat().st_size, sha256=checksum,
+                    ))
+                    await db.commit()
+            else:
+                checksum = output['sha256']
             size = package.stat().st_size
             storage = await run_blocking(get_storage, job['storage_id'])
             await run_blocking(storage.ensure_dir, job['target_path'])
@@ -381,7 +439,7 @@ class TelegramArchiveWorker:
                 task.lease_token = task.lease_until = task.next_retry_at = task.last_error = None
                 await db.commit()
         finally:
-            # Also remove failed/interrupted attempts; retries rebuild deterministically.
+            # Only incomplete working files are temporary; the recorded ZIP survives retries.
             await run_blocking(shutil.rmtree, workdir, True)
 
     async def _archive_files(self, job: dict[str, Any]) -> None:

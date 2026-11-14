@@ -6,6 +6,7 @@ from pydantic import Field, field_validator
 from module_telegram.entity.vo.telegram_vo import TelegramBaseModel
 
 MAX_ARCHIVE_NAME_BYTES = 180
+MAX_MEDIA_NAME_BYTES = 140
 
 
 class ArchiveLibraryQuery(TelegramBaseModel):
@@ -21,6 +22,22 @@ class ArchiveLibraryQuery(TelegramBaseModel):
 
 class ArchiveCleanupModel(TelegramBaseModel):
     message_ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class MediaRenameModel(TelegramBaseModel):
+    media_name: str = Field(default='', max_length=200)
+
+    @field_validator('media_name')
+    @classmethod
+    def validate_media_name(cls, value: str) -> str:
+        name = value.strip()
+        if name and (
+            name in {'.', '..'} or name.endswith('.')
+            or re.search(r'[<>:"/\\|?*\x00-\x1f\x7f]', name)
+            or len(name.encode('utf-8')) > MAX_MEDIA_NAME_BYTES
+        ):
+            raise ValueError('素材名称不能包含路径或特殊字符，长度不超过 140 字节；留空可恢复自动命名')
+        return name
 
 
 class ArchiveSubmitModel(TelegramBaseModel):

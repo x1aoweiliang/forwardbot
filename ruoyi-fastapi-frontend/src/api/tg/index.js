@@ -74,6 +74,7 @@ export const forwardRecordApi = {
 export const archiveApi = {
   library(params) { return request({ url: '/telegram/archive/library', params }); },
   detail(id) { return request({ url: `/telegram/archive/message/${id}` }); },
+  rename(id, data) { return request({ url: `/telegram/archive/message/${id}/name`, method: 'put', data }); },
   retryDownload(id) { return request({ url: `/telegram/archive/message/${id}/retry`, method: 'post' }); },
   cleanup(data) { return request({ url: '/telegram/archive/local/cleanup', method: 'post', data, timeout: 180000 }); },
   quarkStatus(id) { return request({ url: `/telegram/archive/quark/${id}/status`, timeout: 180000 }); },

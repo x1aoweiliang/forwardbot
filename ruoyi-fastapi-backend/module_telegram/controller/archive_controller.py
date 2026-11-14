@@ -16,6 +16,7 @@ from module_telegram.entity.vo.archive_vo import (
     ArchiveFolderModel,
     ArchiveLibraryQuery,
     ArchiveSubmitModel,
+    MediaRenameModel,
 )
 from module_telegram.service.archive_quark_auth import quark_login_service
 from module_telegram.service.archive_service import TelegramArchiveService
@@ -64,6 +65,15 @@ async def retry_download(
 ) -> Response:
     count = await TelegramArchiveService.retry_download(db, message_id)
     return ResponseUtil.success(msg=f'已重新安排 {count} 个下载任务')
+
+
+@archive_controller.put('/message/{message_id}/name', dependencies=[WritePermission])
+async def rename_media(
+    request: Request, message_id: int, item: MediaRenameModel,
+    db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    await TelegramArchiveService.rename_media(db, message_id, item)
+    return ResponseUtil.success(msg='素材名称已保存' if item.media_name else '已恢复自动命名')
 
 
 @archive_controller.get('/storages', dependencies=[ReadPermission])

@@ -19,7 +19,7 @@
       <el-form-item label="状态"><el-select v-model="query.state" clearable placeholder="全部状态" @change="search">
         <el-option v-for="item in filters" :key="item.value" :label="item.label" :value="item.value" />
       </el-select></el-form-item>
-      <el-form-item><el-input v-model="query.keyword" placeholder="搜索原文" clearable @keyup.enter="search" /></el-form-item>
+      <el-form-item><el-input v-model="query.keyword" placeholder="搜索原文或素材名称" clearable @keyup.enter="search" /></el-form-item>
       <el-form-item><el-button type="primary" @click="search">搜索</el-button><el-button @click="refresh">刷新</el-button></el-form-item>
     </el-form>
     <el-table ref="libraryTable" v-loading="loading" :data="rows" row-key="messageId" @selection-change="selected = $event">
@@ -27,6 +27,7 @@
       <el-table-column label="消息" min-width="300"><template #default="{ row }">
         <el-button link type="primary" @click="openDetail(row)">{{ row.sourceChatTitle || row.sourceChatId }} · #{{ row.telegramMessageId }}</el-button>
         <p class="message-excerpt">{{ row.messageText || '无文字说明' }}</p>
+        <p class="media-names" :title="row.mediaNames?.join('、')">素材名称：{{ row.mediaNames?.join('、') || '无图片或视频' }}</p>
       </template></el-table-column>
       <el-table-column label="素材" width="160"><template #default="{ row }">
         <div>{{ row.readyCount }} / {{ row.mediaCount }} 个已就绪</div><small>{{ formatBytes(row.downloadedBytes) }} / {{ formatBytes(row.totalBytes) }}</small>
@@ -34,8 +35,9 @@
       <el-table-column label="下载" width="120"><template #default="{ row }"><el-tag :type="tagType(row.downloadState)">{{ label(row.downloadState) }}</el-tag></template></el-table-column>
       <el-table-column label="归档" width="110"><template #default="{ row }"><el-tag :type="row.archived ? 'success' : 'info'">{{ row.archived ? '已归档' : '待归档' }}</el-tag></template></el-table-column>
       <el-table-column label="消息时间" width="180"><template #default="{ row }">{{ parseTime(row.sentAt || row.createTime) }}</template></el-table-column>
-      <el-table-column label="操作" width="290"><template #default="{ row }">
+      <el-table-column label="操作" width="330"><template #default="{ row }">
         <el-button link type="primary" @click="openDetail(row)">查看</el-button>
+        <el-button v-hasPermi="['tg:archive:write']" link type="primary" @click="openRename(row)">改名</el-button>
         <el-button v-hasPermi="['tg:archive:write']" link type="primary" :disabled="row.downloadState !== 'ready' || !row.readyCount" @click="openArchive([row])">归档</el-button>
         <el-button v-if="['failed', 'deleted'].includes(row.downloadState)" v-hasPermi="['tg:archive:write']" link type="warning" @click="retryDownload(row.messageId)">{{ row.downloadState === 'deleted' ? '重新下载' : '重试' }}</el-button>
         <el-button v-hasPermi="['tg:archive:write']" link type="danger" :disabled="cleaning || !row.mediaCount" @click="cleanupLocal([row])">清理本地</el-button>
@@ -48,6 +50,7 @@
       <div v-loading="detailLoading" v-if="detail">
         <div class="detail-source">{{ detail.sourceChatTitle }} · #{{ detail.telegramMessageId }}<small>{{ parseTime(detail.sentAt || detail.createTime) }}</small></div>
         <pre class="original-text">{{ detail.messageText || '无文字说明' }}</pre>
+        <p>素材命名：{{ detail.mediaName || '使用消息文字，空文字时使用消息 ID' }} <el-button v-hasPermi="['tg:archive:write']" link type="primary" @click="openRename(detail)">改名</el-button></p>
         <div class="media-grid">
           <article v-for="media in detail.medias" :key="media.mediaId" class="media-card">
             <template v-if="media.downloadStatus === 'ready' && previewUrls[media.mediaId]">
@@ -74,13 +77,23 @@
           <div class="record-heading"><strong>{{ storageName(task.storageId) }}</strong><el-tag :type="tagType(task.status)">{{ task.archiveFormat === 'zip' && task.status === 'uploading' ? '打包 / 上传中' : label(task.status) }}</el-tag></div>
           <p class="archive-path">/{{ [task.targetPath, task.packageName].filter(Boolean).join('/') }}</p>
           <p v-if="task.archiveFormat === 'zip'">ZIP 压缩包 · 共 {{ task.mediaCount }} 个素材</p>
-          <small v-if="task.mediaRevision !== detail.mediaRevision">这份归档之后有新素材到达，可以再次归档完整消息。</small>
+          <small v-if="task.mediaRevision !== detail.mediaRevision">这份归档之后素材或名称有更新，可以再次归档。</small>
+          <p v-if="task.localZipAvailable">本地 ZIP 已保留<span v-if="task.sourceCleanup === 'completed'">，原始素材已清理</span>。</p>
+          <p v-if="task.status === 'completed' && task.sourceCleanup === 'pending'">已上传，等待清理本次归档的原始素材。</p>
+          <p v-if="task.cleanupError" class="error-text">{{ task.cleanupError }}</p>
           <div v-for="file in task.files" :key="file.name" class="archive-file"><span>{{ file.name }}</span><span>{{ label(file.status) }}</span></div>
           <p v-if="task.lastError" class="error-text">{{ task.lastError }}</p>
           <el-button v-if="['failed', 'retry'].includes(task.status)" v-hasPermi="['tg:archive:write']" link type="primary" @click="retryArchive(task.taskId)">重试归档</el-button>
+          <el-button v-if="task.status === 'completed' && task.localZipAvailable" v-hasPermi="['tg:archive:write']" link type="primary" @click="retryArchive(task.taskId)">重新上传 ZIP</el-button>
         </article>
       </div>
     </el-drawer>
+
+    <el-dialog v-model="renameOpen" title="修改素材名称" width="480px" :close-on-click-modal="false" :close-on-press-escape="!renaming" :show-close="!renaming">
+      <p>填写「第一集」「第五集」等名称，归档时自动保留扩展名。多个素材会加 _01、_02；原消息文字保留。</p>
+      <el-input v-model="renameForm.mediaName" clearable :disabled="renaming" maxlength="140" placeholder="留空恢复消息文字或消息 ID 命名" @keyup.enter="saveRename" />
+      <template #footer><el-button :disabled="renaming" @click="renameOpen = false">取消</el-button><el-button type="primary" :loading="renaming" @click="saveRename">保存名称</el-button></template>
+    </el-dialog>
 
     <el-dialog v-model="quarkOpen" title="夸克账号" width="440px" @closed="closeQuark" :close-on-click-modal="false">
       <el-select v-model="quarkStorageId" style="width:100%" :disabled="quarkLoading" @change="checkQuark">
@@ -98,6 +111,7 @@
 
     <el-dialog v-model="archiveOpen" title="归档素材" width="620px" :close-on-click-modal="false">
       <p>将 {{ archiveIds.length }} 条消息的图片和视频按消息从早到晚放入同一个 ZIP，再上传到所选目录。包内保留素材文件名，原文保留在素材库中。</p>
+      <el-alert title="上传成功后保留本地 ZIP，自动清理本次归档的原始图片和视频。上传失败时保留原素材。" type="info" :closable="false" />
       <el-form label-position="top">
         <el-form-item label="ZIP 压缩包名称" required>
           <el-input v-model="archiveForm.archiveName" :disabled="submitting" placeholder="填写剧名，例如 abc" maxlength="180" @keyup.enter="submitArchive">
@@ -133,6 +147,7 @@ const rows = ref([]), total = ref(0), selected = ref([]), loading = ref(false);
 const accounts = ref([]), chats = ref([]), storageOptions = ref([]);
 const query = reactive({ pageNum: 1, pageSize: 20, state: undefined, keyword: '', accountId: undefined, sourceChatPk: undefined });
 const detailOpen = ref(false), detailLoading = ref(false), detail = ref(null), previewUrls = reactive({});
+const renameOpen = ref(false), renaming = ref(false), renameForm = reactive({ messageId: null, mediaName: '' });
 const archiveOpen = ref(false), archiveIds = ref([]), archiveForm = reactive({ storageId: '', archiveName: '' });
 const zipFileName = computed(() => {
   const name = archiveForm.archiveName.trim().replace(/\.zip$/i, '').trim();
@@ -192,6 +207,18 @@ async function openDetail(row) {
   try { await refreshDetail(); } finally { detailLoading.value = false; }
 }
 function clearDetail() { detailSequence++; detail.value = null; Object.keys(previewUrls).forEach(key => delete previewUrls[key]); }
+function openRename(message) {
+  renameForm.messageId = message.messageId; renameForm.mediaName = message.mediaName || ''; renameOpen.value = true;
+}
+async function saveRename() {
+  if (renaming.value || !renameForm.messageId) return;
+  renaming.value = true;
+  try {
+    const result = await archiveApi.rename(renameForm.messageId, { mediaName: renameForm.mediaName.trim() });
+    proxy.$modal.msgSuccess(result.msg); renameOpen.value = false;
+    await Promise.all([refresh(true), refreshDetail()]);
+  } finally { renaming.value = false; }
+}
 async function retryDownload(id) { const result = await archiveApi.retryDownload(id); proxy.$modal.msgSuccess(result.msg); await Promise.all([refresh(true), refreshDetail()]); }
 async function retryArchive(id) { const result = await archiveApi.retryArchive(id); proxy.$modal.msgSuccess(result.msg); await refreshDetail(); }
 async function cleanupLocal(messages) {
@@ -321,6 +348,7 @@ onUnmounted(() => { disposed = true; closeQuark(); clearInterval(pollTimer); lib
 </script>
 
 <style scoped>
+.media-names { margin:6px 0; color:var(--el-color-primary); overflow-wrap:anywhere; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .library-heading,.record-heading,.folder-toolbar,.archive-file { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .library-actions { display:flex; gap:8px; flex-wrap:wrap; } .quark-login { min-height:160px; text-align:center; padding:20px 0; } .quark-login img { display:block; margin:12px auto; } .quark-note { color:var(--el-text-color-secondary); font-size:13px; }
 .library-heading { margin-bottom:24px; } h2 { margin:0 0 8px; font-size:24px; } .library-heading p,small { color:var(--el-text-color-secondary); }
